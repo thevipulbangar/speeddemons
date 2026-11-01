@@ -64,7 +64,8 @@ fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut
         let mut mask = lf(0) | lf(32) << 32;
         while mask != 0 {
             let lf = pos + mask.trailing_zeros() as usize;
-            f(line, &data[line..lf]);
+            // SAFETY: start <= line <= lf < end <= data.len().
+            f(line, unsafe { data.get_unchecked(line..lf) });
             line = lf + 1;
             mask &= mask - 1;
         }
@@ -82,7 +83,8 @@ fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut
 /// Only four days occur (Oct 30, Oct 31, Nov 1, Nov 2), so no date library is needed.
 #[inline(always)]
 fn hour_of(l: &[u8]) -> usize {
-    let d = |i: usize| (l[i] - b'0') as usize;
+    // SAFETY: a line is at least 39 bytes, so bytes 6..13 exist.
+    let d = |i: usize| (unsafe { *l.get_unchecked(i) } - b'0') as usize;
     let day = d(8) * 10 + d(9);
     let day_idx = if l[6] == b'0' { day - 30 } else { day + 1 };
     day_idx * 24 + d(11) * 10 + d(12) - 18
@@ -120,7 +122,8 @@ fn parse_rest(l: &[u8]) -> (&[u8], bool, u32) {
         let d4 = _mm_madd_epi16(d2, _mm_set1_epi32(0x0001_0064)); // pairs: 100 * a + b
         let g: [u32; 4] = std::mem::transmute(d4);
         let lat = (g[1] as u64 * 100_000_000 + g[2] as u64 * 10_000 + g[3] as u64) as u32;
-        (&l[ep..sp - 4], l[sp - 3] == b'5', lat)
+        // SAFETY: 29 <= ep and the status's 3 digits and a space lie between ep and sp.
+        (l.get_unchecked(ep..sp - 4), *l.get_unchecked(sp - 3) == b'5', lat)
     }
 }
 
@@ -181,7 +184,8 @@ impl Table {
         let mask = self.slots.len() - 1;
         let mut i = Self::hash(k) & mask;
         loop {
-            let s = self.slots[i];
+            // SAFETY: i is masked by slots.len() - 1, and slots.len() is a power of two.
+            let s = unsafe { *self.slots.get_unchecked(i) };
             if s == 0 {
                 break;
             }
@@ -256,10 +260,14 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
     for (b, rank) in buckets.iter_mut().zip(rank) {
         for x in b.ids.iter_mut() {
             let v: u32 = (*x).into();
-            let r = rank[v as usize >> 1] as usize;
-            count[r] += 1;
-            count[e + r] += v & 1;
-            *x = T::try_from(r).ok().unwrap(); // remap to the global rank once, for the scatter
+            // SAFETY: every id came from this thread's table, which `rank` covers, and every rank
+            // is below `e`, which `run` checked fits in `T`.
+            unsafe {
+                let r = *rank.get_unchecked(v as usize >> 1) as usize;
+                *count.get_unchecked_mut(r) += 1;
+                *count.get_unchecked_mut(e + r) += v & 1;
+                *x = T::try_from(r).unwrap_unchecked(); // remap to the rank once, for the scatter
+            }
         }
         total += b.ids.len();
     }
@@ -271,9 +279,10 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
     lat.resize(total, 0);
     for b in buckets {
         for (&r, &v) in b.ids.iter().zip(&b.lat) {
-            let r: u32 = r.into();
-            lat[count[r as usize] as usize] = v;
-            count[r as usize] += 1;
+            let c = &mut count[Into::<u32>::into(r) as usize];
+            // SAFETY: the cursors of rank r run over r's own range, which lies inside `total`.
+            unsafe { *lat.get_unchecked_mut(*c as usize) = v };
+            *c += 1;
         }
     } // the records of this hour are freed here
     let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap(); // fixed size: no memcpy call
@@ -343,8 +352,10 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                             overflow = true;
                             return;
                         };
-                        hours[h].ids.push(id);
-                        hours[h].lat.push(latency);
+                        // SAFETY: the spec puts every timestamp inside the 72 hours, so h < HOURS.
+                        let bucket = unsafe { hours.get_unchecked_mut(h) };
+                        bucket.ids.push(id);
+                        bucket.lat.push(latency);
                     });
                     (table, hours, overflow)
                 })

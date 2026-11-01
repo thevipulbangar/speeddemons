@@ -18,3 +18,11 @@ Local numbers are from a laptop (Ryzen 7 5800H, Docker Desktop on WSL2, 12 threa
 | 4b | Not worth it: percentile selection is only ~110 M of 1.23 G instructions (measured by replacing it with a plain index) | local | | | |
 | 4c | Failed: scan blocks one by one instead of merging runs of blocks (-8 lines), instructions +3-4% | local | | | |
 | 5 | Not kept: newline scan 64 bytes per step (two compares, one 64-bit mask) and digit formatting through a fixed 24-byte block (no memcpy call per number). User instructions -6% (1.162 G -> 1.095 G, perf stat), but local wall and CPU time did not drop: the passes are bound by memory, not instructions | local | | | |
+| 6 | Single pass after all: every line becomes a record (endpoint id + 5xx flag, latency) in its thread's bucket for its hour; names merged and ranked once; per hour a counting sort by rank, three selects, offset-claimed writes. The box runs at a fixed 2.5 GHz and is compute-bound, so skipping the second read pays there even though the laptop showed no gain. 8-byte records | (f5bafe8) | 0.0346 | 31.0 | |
+| 7 | 6-byte records (u16 id) with a correct fallback: if any id does not fit, the run discards its records and redoes the job with u32 ids | run-7cea7550a58f | 0.0351 | 27.0 | |
+| 8 | Fewer lines: single-constant SIMD weights, shift-based compare mask, output queue as a tuple (S 387 -> 360) | run-eea7c07b6da4 | 0.0355 | 27.0 | |
+| 9 | Fewer user-space instructions (perf stat, 1.119 G -> 1.008 G): 64-byte newline masks, digits through a fixed 24-byte block, the hour recomputed only when bytes 5..13 change | run-19bf9d43439c | 0.0338 | 27.0 | |
+| 9a | Not kept: shorter hash line; slicing `k[..n.min(8)]` made the copy variable-length, a memcpy call per line (+11% instructions) | local | | | |
+| 9b | Not kept: more threads or fewer (6, 8, 10), MAP_POPULATE (serial page-table fill, slower), fixed-size record blocks (the Vec slack is never touched, < 0.5 MB) | local | | | |
+| 10 | Hour label copied as a fixed 21-byte array (no memcpy call per row), -0.3% instructions | (293de40) | | | |
+| 11 | Bounds checks removed where an invariant guarantees the index (counting sort, scatter, table probe, hour bucket, line slices, field parse), each with a SAFETY comment: 1.005 G -> 0.881 G user instructions (-12%) | local | | | |
