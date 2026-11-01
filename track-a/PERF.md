@@ -26,3 +26,4 @@ Local numbers are from a laptop (Ryzen 7 5800H, Docker Desktop on WSL2, 12 threa
 | 9b | Not kept: more threads or fewer (6, 8, 10), MAP_POPULATE (serial page-table fill, slower), fixed-size record blocks (the Vec slack is never touched, < 0.5 MB) | local | | | |
 | 10 | Hour label copied as a fixed 21-byte array (no memcpy call per row), -0.3% instructions | (293de40) | | | |
 | 11 | Bounds checks removed where an invariant guarantees the index (counting sort, scatter, table probe, hour bucket, line slices, field parse), each with a SAFETY comment: 1.005 G -> 0.881 G user instructions (-12%) | local | | | |
+| 12 | Groups of at most 32 latencies are sorted once (insertion sort) instead of three selects: -2.7% instructions (0.881 G -> 0.857 G) | local | | | |

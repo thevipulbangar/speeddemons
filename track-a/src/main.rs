@@ -301,10 +301,14 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
         put_num(&mut buf, n as u64, b' ');
         // Nearest rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything from
         // that index on in v[lo..], so the next search is smaller.
+        // Small groups (most of them, in the Zipf tail): one insertion sort beats three selects.
+        if n <= 32 {
+            v.sort_unstable();
+        }
         let mut lo = 0;
         for p in [50, 95, 99] {
             let k = (p * n + 99) / 100 - 1;
-            let x = *v[lo..].select_nth_unstable(k - lo).1;
+            let x = if n <= 32 { v[k] } else { *v[lo..].select_nth_unstable(k - lo).1 };
             put_num(&mut buf, x as u64, b' ');
             lo = k;
         }
