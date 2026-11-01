@@ -19,12 +19,18 @@ the map get close ids. The text is then parsed once more straight into the final
 new ids. An edge is 6 bytes: a u32 head and a u16 weight. The few weights of 65535 or more are
 escaped into a small sorted side table.
 
+**Reverse weights.** After the final CSR is built, every entry also gets the weight of the
+reverse edge (found by scanning the head's short row), so one 8-byte entry serves both a
+forward and a backward search and there is no second graph. In-edges whose reverse does not
+exist (one-way streets) go into a small sorted side list, flagged per node.
+
 **Queries.** Trivial queries are answered up front (`s == t`, a target with no in-edges, a source
 with no out-edges). The rest are handed out to 12 threads through an atomic counter. Each thread
-runs Dijkstra with a radix heap of 8-byte entries; the low 32 bits of a key are enough because
+runs bidirectional Dijkstra: it always expands the side with fewer queued entries and stops
+when the two smallest keys add up to the best meeting distance. Each side uses a radix heap of 8-byte entries; the low 32 bits of a key are enough because
 every queued key is within one u32 weight of the last settled one. Distances live in 64-node
 blocks allocated on first touch from a per-thread pool, so memory follows the size of the search.
-They are stored as u32; the rare search that reaches 2^32 - 1 is rerun with u64 slots. When a
+They are stored as u32; the rare search that reaches 2^32 - 1 is rerun as a one-sided search with u64 slots. When a
 node's distance improves, its edge row is prefetched, so it is in cache by the time it is popped.
 
 ## Dependencies

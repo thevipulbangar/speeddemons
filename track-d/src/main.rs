@@ -87,6 +87,10 @@ unsafe impl<T> Sync for Shared<T> {}
 unsafe impl<T> Send for Shared<T> {}
 impl<T> Shared<T> {
     #[inline(always)]
+    fn get(self, i: usize) -> T {
+        unsafe { self.0.add(i).read() }
+    }
+    #[inline(always)]
     fn put(self, i: usize, x: T) {
         unsafe { self.0.add(i).write(x) }
     }
@@ -172,15 +176,21 @@ fn sort_buckets<T: Copy + Send + Sync>(
 #[repr(C, packed)]
 struct Edge {
     head: u32,
-    w: u16,
+    w: u16,   // weight of this edge
+    win: u16, // weight of the reverse edge head -> tail, or ABSENT
 }
-const ESCAPE: u64 = 0xFFFF;
+const ESCAPE: u64 = 0xFFFE; // weight too big for 16 bits: look it up in `heavy`
+const ABSENT: u16 = 0xFFFF; // no reverse edge
 
 /// Final forward graph under the new ids.
 struct Graph {
     off: Vec<u32>,
     edges: Vec<Edge>,
     heavy: Vec<(u32, u32, u64)>, // (tail, head, weight) for weights >= ESCAPE, sorted
+    // In-edges y -> x that no row-x entry carries (x -> y does not exist): (x, y, weight),
+    // sorted, with one bit per x saying whether it has any.
+    side: Vec<(u32, u32, u64)>,
+    has_side: Vec<u64>,
 }
 
 impl Graph {
@@ -190,6 +200,69 @@ impl Graph {
     fn heavy(&self, u: u32, v: u32) -> u64 {
         let i = self.heavy.partition_point(|&(a, b, _)| (a, b) < (u, v));
         self.heavy[i].2
+    }
+
+    #[inline(always)]
+    fn row(&self, u: usize) -> &[Edge] {
+        &self.edges[self.off[u] as usize..self.off[u + 1] as usize]
+    }
+
+    /// Weight of tail -> head, stored as `w16` (ESCAPE means look it up).
+    #[inline(always)]
+    fn weight(&self, tail: u32, head: u32, w16: u16) -> u64 {
+        if w16 as u64 == ESCAPE { self.heavy(tail, head) } else { w16 as u64 }
+    }
+
+    /// Fills every entry's reverse weight, so a backward search reads the same rows as a
+    /// forward one, and lists the in-edges no row can carry. Rows are short, so finding
+    /// the reverse edge is a scan of the head's row.
+    fn link(&mut self) {
+        let n = self.off.len() - 1;
+        let out = Shared(self.edges.as_mut_ptr());
+        let g = &*self;
+        let side = par(|k| {
+            let mut side = Vec::new();
+            for u in n * k / THREADS..n * (k + 1) / THREADS {
+                for i in g.off[u] as usize..g.off[u + 1] as usize {
+                    let e = out.get(i);
+                    // Parallel reverse edges: only the lightest matters.
+                    let back = g.row(e.head as usize).iter().filter(|r| r.head == u as u32);
+                    let win = back.map(|r| g.weight(e.head, u as u32, r.w)).min();
+                    let win = match win {
+                        None => {
+                            side.push((e.head, u as u32, g.weight(u as u32, e.head, e.w)));
+                            ABSENT
+                        }
+                        Some(w) => w.min(ESCAPE) as u16,
+                    };
+                    out.put(i, Edge { win, ..e });
+                }
+            }
+            side
+        });
+        let mut side = side.concat();
+        side.sort_unstable();
+        let mut has_side = vec![0u64; n.div_ceil(64)];
+        for &(x, _, _) in &side {
+            has_side[x as usize / 64] |= 1 << (x % 64);
+        }
+        (self.side, self.has_side) = (side, has_side);
+    }
+
+    /// Calls f(neighbour, weight) for every edge into x.
+    #[inline(always)]
+    fn each_in(&self, x: usize, mut f: impl FnMut(u32, u64)) {
+        for e in self.row(x) {
+            if e.win != ABSENT {
+                f(e.head, self.weight(e.head, x as u32, e.win));
+            }
+        }
+        if self.has_side[x / 64] >> (x % 64) & 1 != 0 {
+            let i = self.side.partition_point(|&(a, _, _)| (a as usize) < x);
+            for &(_, y, w) in self.side[i..].iter().take_while(|s| s.0 as usize == x) {
+                f(y, w);
+            }
+        }
     }
 }
 
@@ -326,7 +399,7 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
             for &(u, v, w) in batch.iter() {
                 let (u, v) = (perm[u] as usize, perm[v]);
                 let slot = bcur[u >> LOW].fetch_add(1, Relaxed) as usize;
-                out.put(slot, Edge { head: v << LOW | (u & LOW_MASK) as u32, w: w.min(ESCAPE) as u16 });
+                out.put(slot, Edge { head: v << LOW | (u & LOW_MASK) as u32, w: w.min(ESCAPE) as u16, win: 0 });
                 if w >= ESCAPE {
                     heavy.push((u as u32, v, w));
                 }
@@ -348,7 +421,9 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
     sort_buckets(&mut edges, &bstart, &mut off, |e| e.head as usize & LOW_MASK, |e| Edge { head: e.head >> LOW, ..e });
     let mut heavy: Vec<_> = heavy.concat();
     heavy.sort_unstable();
-    (Graph { off, edges, heavy }, perm, has_in)
+    let mut g = Graph { off, edges, heavy, side: Vec::new(), has_side: Vec::new() };
+    g.link();
+    (g, perm, has_in)
 }
 
 #[inline(always)]
@@ -365,12 +440,14 @@ unsafe fn prefetch<T>(p: *const T) {
 /// is enough to rebuild it exactly.
 struct RadixHeap {
     last: u64,
+    len: usize, // entries queued, stale ones included
     buckets: [Vec<u64>; 65],
 }
 
 impl RadixHeap {
     fn clear(&mut self) {
         self.last = 0;
+        self.len = 0;
         self.buckets.iter_mut().for_each(Vec::clear);
     }
 
@@ -386,7 +463,18 @@ impl RadixHeap {
 
     #[inline(always)]
     fn push(&mut self, key: u64, v: u32) {
+        self.len += 1;
         self.file(key, key << 32 | v as u64);
+    }
+
+    /// Smallest queued key (a lower bound: it may belong to a stale entry).
+    #[inline(always)]
+    fn peek(&mut self) -> Option<u64> {
+        self.pop().map(|(k, v)| {
+            self.buckets[0].push(k << 32 | v as u64);
+            self.len += 1;
+            k
+        })
     }
 
     #[inline(always)]
@@ -405,6 +493,7 @@ impl RadixHeap {
             self.buckets[i] = b; // keep its capacity
         }
         let e = self.buckets[0].pop()?;
+        self.len -= 1;
         Some((self.last, e as u32))
     }
 }
@@ -454,7 +543,7 @@ impl<D: Dist> Search<D> {
             dir: vec![NONE; n.div_ceil(BLOCK)],
             pool: Vec::with_capacity(n.div_ceil(BLOCK) * BLOCK), // address space only
             blocks: Vec::new(),
-            heap: RadixHeap { last: 0, buckets: std::array::from_fn(|_| Vec::new()) },
+            heap: RadixHeap { last: 0, len: 0, buckets: std::array::from_fn(|_| Vec::new()) },
         }
     }
 
@@ -469,6 +558,66 @@ impl<D: Dist> Search<D> {
             self.blocks.push(b as u32);
         }
         unsafe { self.pool.get_unchecked_mut(i as usize * BLOCK + v % BLOCK) }
+    }
+
+    /// Distance of v if this search has reached it.
+    #[inline(always)]
+    fn get(&self, v: usize) -> u64 {
+        match self.dir[v / BLOCK] {
+            NONE => INF,
+            i => match unsafe { *self.pool.get_unchecked(i as usize * BLOCK + v % BLOCK) }.wide() {
+                x if x == D::INF.wide() => INF, // block allocated, node not reached
+                x => x,
+            },
+        }
+    }
+
+    fn reset(&mut self, s: usize) {
+        for &b in &self.blocks {
+            self.dir[b as usize] = NONE;
+        }
+        self.blocks.clear();
+        self.pool.clear();
+        self.heap.clear();
+        *self.dist(s) = D::narrow(0);
+        self.heap.push(0, s as u32);
+    }
+
+    /// One step of a bidirectional search: settles the closest queued node and relaxes its
+    /// out-edges (forward) or in-edges (backward). `best` is the shortest s-t path seen,
+    /// through a node both searches have reached. Returns false if a distance overflows D.
+    #[inline(always)]
+    fn step(&mut self, other: &Self, g: &Graph, forward: bool, best: &mut u64) -> bool {
+        let (du, u) = self.heap.pop().unwrap();
+        if du > self.dist(u as usize).wide() {
+            return true; // stale entry
+        }
+        let mut ok = true;
+        let mut relax = |v: u32, w: u64| {
+            let nd = du + w;
+            if nd >= D::INF.wide() {
+                ok = false;
+                return;
+            }
+            let dv = self.dist(v as usize);
+            if nd < dv.wide() {
+                *dv = D::narrow(nd);
+                self.heap.push(nd, v);
+                unsafe { prefetch(g.edges.as_ptr().add(*g.off.get_unchecked(v as usize) as usize)) };
+                let o = other.get(v as usize);
+                if o != INF {
+                    *best = (*best).min(nd + o);
+                }
+            }
+        };
+        if forward {
+            for e in g.row(u as usize) {
+                relax(e.head, g.weight(u, e.head, e.w));
+            }
+        } else {
+            g.each_in(u as usize, relax);
+        }
+        ok
     }
 
     /// Dijkstra from s, stopped when t is settled. Returns INF if t is unreachable, or None
@@ -510,6 +659,25 @@ impl<D: Dist> Search<D> {
     }
 }
 
+/// Bidirectional Dijkstra. Each step expands the side with fewer queued entries (a near
+/// 2^32 first edge would make key-based alternation flood one side); it stops once the two
+/// smallest keys add up to the best meeting distance. None if a distance overflows u32.
+fn bidi(f: &mut Search<u32>, b: &mut Search<u32>, g: &Graph, s: usize, t: usize) -> Option<u64> {
+    f.reset(s);
+    b.reset(t);
+    let mut best = INF;
+    while let (Some(kf), Some(kb)) = (f.heap.peek(), b.heap.peek()) {
+        if kf + kb >= best {
+            break;
+        }
+        let ok = if f.heap.len <= b.heap.len { f.step(b, g, true, &mut best) } else { b.step(f, g, false, &mut best) };
+        if !ok {
+            return None;
+        }
+    }
+    Some(best)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data = args.get(1).map_or("/data", |s| s.as_str());
@@ -540,11 +708,11 @@ fn main() {
     // Work-stealing over queries: each thread grabs the next index until none are left.
     let next = AtomicUsize::new(0);
     par(|_| {
-        let mut small = Search::<u32>::new(n);
+        let (mut fw, mut bw) = (Search::<u32>::new(n), Search::<u32>::new(n));
         let mut wide: Option<Search<u64>> = None;
         while let Some((a, b, ans)) = queries.get(next.fetch_add(1, Relaxed)) {
             if ans.load(Relaxed) == TODO {
-                let d = small.run(&g, *a, *b).unwrap_or_else(|| {
+                let d = bidi(&mut fw, &mut bw, &g, *a, *b).unwrap_or_else(|| {
                     let w = wide.get_or_insert_with(|| Search::new(n));
                     w.run(&g, *a, *b).unwrap()
                 });
