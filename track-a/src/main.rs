@@ -1,24 +1,25 @@
 //! Track A (Ingest): per (hour, endpoint) request count, p50/p95/p99 latency and 5xx rate.
 //!
-//! The log is mmapped and read once:
-//!   parse   one chunk per thread; every line becomes a 6-byte record (endpoint id with the
-//!           5xx flag, latency) in that thread's bucket for the line's hour;
-//!   names   all threads' endpoints are deduplicated and sorted once, which maps every local
-//!           id to its rank, the output order inside an hour;
-//!   finish  hours are handed out in order; a worker counting-sorts the hour's records from
-//!           all threads by rank, frees them, picks the percentiles and writes the hour at
-//!           its file offset once every earlier hour has claimed its place.
-//! Disorder in the log never matters: a line simply goes to its hour's bucket.
+//! The log is mmapped and read twice, and almost nothing is kept in memory:
+//!   pass 1  (one chunk per thread) reads just the hour of every line and records, per 16 KiB
+//!           block of the file, a 72-bit mask of the hours present in it;
+//!   pass 2  goes hour by hour with all threads together: each parses a share of the blocks
+//!           holding the hour, the per-endpoint counts give every (thread, endpoint) pair a
+//!           range of one shared hour buffer, then each thread selects and formats a share
+//!           of the endpoints and writes it at its place in the file.
+//! Only one hour of latencies (~170 KB) is ever held. Disorder in the log costs speed only.
 use std::arch::x86_64::*;
+use std::cell::UnsafeCell;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 use std::thread;
 
 const HOURS: usize = 72; // 2026-10-30T18 .. 2026-11-02T17, fixed by the spec
 const THREADS: usize = 12; // the scoring box gives us exactly 12 hardware threads
+const BLOCK_SHIFT: u32 = 14; // 16 KiB blocks, about 200 lines each
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -51,7 +52,7 @@ fn line_start(data: &[u8], mut p: usize) -> usize {
 }
 
 /// Calls `f(offset, line)` on every line (without its LF) in data[start..end]; both bounds are
-/// line starts. Newlines are found 64 bytes at a time with AVX2.
+/// line starts. Newlines are found 32 bytes at a time with AVX2.
 #[inline(always)]
 fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(usize, &'a [u8])) {
     let (mut line, mut pos) = (start, start);
@@ -90,6 +91,12 @@ fn hour_of(l: &[u8]) -> usize {
     day_idx * 24 + d(11) * 10 + d(12) - 18
 }
 
+/// Bytes 5..13 of a timestamp, `MM-DDTHH`, as one word: equal exactly when the hour is.
+#[inline(always)]
+fn hour_key(l: &[u8]) -> u64 {
+    u64::from_le_bytes(l[5..13].try_into().unwrap())
+}
+
 /// `YYYY-MM-DDTHH:00:00Z ` for hour index h, the start of every output line of that hour.
 fn hour_label(h: usize) -> String {
     let abs = 18 + h; // hours since 2026-10-30T00
@@ -118,8 +125,8 @@ fn parse_rest(l: &[u8]) -> (&[u8], bool, u32) {
         let lanes = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         let keep = _mm_cmpgt_epi8(lanes, _mm_set1_epi8(last as i8));
         let d = _mm_and_si128(_mm_sub_epi8(tail, _mm_set1_epi8(b'0' as i8)), keep);
-        let d2 = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A)); // byte pairs: 10 * a + b
-        let d4 = _mm_madd_epi16(d2, _mm_set1_epi32(0x0001_0064)); // pairs: 100 * a + b
+        let d2 = _mm_maddubs_epi16(d, _mm_set_epi8(1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10));
+        let d4 = _mm_madd_epi16(d2, _mm_set_epi16(1, 100, 1, 100, 1, 100, 1, 100));
         let g: [u32; 4] = std::mem::transmute(d4);
         let lat = (g[1] as u64 * 100_000_000 + g[2] as u64 * 10_000 + g[3] as u64) as u32;
         // SAFETY: 29 <= ep and the status's 3 digits and a space lie between ep and sp.
@@ -133,10 +140,9 @@ fn parse_rest(l: &[u8]) -> (&[u8], bool, u32) {
 unsafe fn same(a: *const u8, b: *const u8, n: usize) -> bool {
     let mut i = 0;
     while i < n {
-        let x = _mm256_loadu_si256(a.add(i) as *const __m256i);
-        let y = _mm256_loadu_si256(b.add(i) as *const __m256i);
+        let (x, y) = (_mm256_loadu_si256(a.add(i) as *const __m256i), _mm256_loadu_si256(b.add(i) as *const __m256i));
         let equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32;
-        let wanted = u32::MAX >> 32usize.saturating_sub(n - i); // the bytes before n
+        let wanted = if n - i >= 32 { u32::MAX } else { (1 << (n - i)) - 1 };
         if !equal & wanted != 0 {
             return false;
         }
@@ -223,18 +229,6 @@ impl Table {
         }
     }
 }
-/// An endpoint id with the 5xx flag in bit 0: u16 (6-byte records) normally, u32 when an
-/// input has more than 32,767 distinct endpoints (the spec's catalogue has 1,842).
-trait Id: Copy + Default + Send + TryFrom<usize> + Into<u32> {}
-impl Id for u16 {}
-impl Id for u32 {}
-
-/// One thread's lines of one hour: `ids[i]` is endpoint id << 1 | is_5xx, `lat[i]` the latency.
-#[derive(Default)]
-struct Bucket<T> {
-    ids: Vec<T>,
-    lat: Vec<u32>,
-}
 
 /// Appends `v` in decimal and then `end`. The digits go into a fixed 24-byte block that is
 /// appended whole and trimmed: a fixed-size copy is two vector moves, a variable one a call.
@@ -250,74 +244,37 @@ fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
     buf.truncate(len + n + 1);
 }
 
-/// Formats hour `h` from its buckets (one per parse thread); `rank[t]` maps thread t's local
-/// endpoint ids to positions in `names`. `count` and `lat` are scratch space reused per hour.
-fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], names: &[&[u8]], count: &mut Vec<u32>, lat: &mut Vec<u32>) -> Vec<u8> {
-    let e = names.len();
-    count.clear();
-    count.resize(2 * e, 0); // [lines per rank | errors per rank]
-    let mut total = 0;
-    for (b, rank) in buckets.iter_mut().zip(rank) {
-        for x in b.ids.iter_mut() {
-            let v: u32 = (*x).into();
-            // SAFETY: every id came from this thread's table, which `rank` covers, and every rank
-            // is below `e`, which `run` checked fits in `T`.
-            unsafe {
-                let r = *rank.get_unchecked(v as usize >> 1) as usize;
-                *count.get_unchecked_mut(r) += 1;
-                *count.get_unchecked_mut(e + r) += v & 1;
-                *x = T::try_from(r).unwrap_unchecked(); // remap to the rank once, for the scatter
+
+/// Data the threads share with no lock. The phases of an hour are separated by barriers, and
+/// within a phase each thread writes only its own part (every use says which).
+struct Shared<T>(UnsafeCell<T>);
+unsafe impl<T: Send> Sync for Shared<T> {}
+impl<T> Shared<T> {
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// A barrier that spins: the scoring box is ours alone, and an hour has five phases, so a
+/// futex sleep and wake per phase would cost more than the work between them.
+struct Spin {
+    arrived: AtomicUsize,
+    round: AtomicUsize,
+}
+
+impl Spin {
+    fn wait(&self) {
+        let round = self.round.load(Acquire);
+        if self.arrived.fetch_add(1, AcqRel) + 1 == THREADS {
+            self.arrived.store(0, Relaxed);
+            self.round.store(round + 1, Release);
+        } else {
+            while self.round.load(Acquire) == round {
+                std::hint::spin_loop();
             }
         }
-        total += b.ids.len();
     }
-    // Counting sort: each endpoint gets a contiguous range of `lat`, ranges in name order.
-    let mut pos = 0;
-    for c in &mut count[..e] {
-        (*c, pos) = (pos, pos + *c);
-    }
-    lat.resize(total, 0);
-    for b in buckets {
-        for (&r, &v) in b.ids.iter().zip(&b.lat) {
-            let c = &mut count[Into::<u32>::into(r) as usize];
-            // SAFETY: the cursors of rank r run over r's own range, which lies inside `total`.
-            unsafe { *lat.get_unchecked_mut(*c as usize) = v };
-            *c += 1;
-        }
-    } // the records of this hour are freed here
-    let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap(); // fixed size: no memcpy call
-    let mut buf = Vec::with_capacity(total * 40);
-    let mut a = 0;
-    for r in 0..e {
-        let b = count[r] as usize; // after the scatter this is the end of rank r's range
-        if a == b {
-            continue;
-        }
-        let v = &mut lat[a..b];
-        let n = v.len();
-        buf.extend_from_slice(&prefix);
-        buf.extend_from_slice(names[r]);
-        buf.push(b' ');
-        put_num(&mut buf, n as u64, b' ');
-        // Nearest rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything from
-        // that index on in v[lo..], so the next search is smaller.
-        // Small groups (most of them, in the Zipf tail): one insertion sort beats three selects.
-        if n <= 32 {
-            v.sort_unstable();
-        }
-        let mut lo = 0;
-        for p in [50, 95, 99] {
-            let k = (p * n + 99) / 100 - 1;
-            let x = if n <= 32 { v[k] } else { *v[lo..].select_nth_unstable(k - lo).1 };
-            put_num(&mut buf, x as u64, b' ');
-            lo = k;
-        }
-        let errs = count[e + r] as u64;
-        put_num(&mut buf, errs, b' ');
-        put_num(&mut buf, errs * 1_000_000 / n as u64, b'\n');
-        a = b;
-    }
-    buf
 }
 
 fn main() {
@@ -325,113 +282,183 @@ fn main() {
     let data_dir = args.get(1).map_or("/data", String::as_str);
     let out_dir = args.get(2).map_or("/out", String::as_str);
     let data = map_file(&format!("{data_dir}/requests.log"));
-    let file = File::create(format!("{out_dir}/summary.txt")).expect("cannot create summary.txt");
-    // Compact ids first; only an input with too many endpoints for them pays for a second run.
-    let _ = run::<u16>(data, &file) || run::<u32>(data, &file);
-}
-
-/// The whole job with ids of type `T`. Returns false, having written nothing, if some id
-/// does not fit in `T`.
-fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
     let len = data.len();
+    let file = File::create(format!("{out_dir}/summary.txt")).expect("cannot create summary.txt");
 
-    // Parse: per thread, an endpoint table and one bucket per hour.
-    let parsed: Vec<(Table, Vec<Bucket<T>>, bool)> = thread::scope(|s| {
-        let handles: Vec<_> = (0..THREADS)
-            .map(|t| {
-                s.spawn(move || {
-                    let a = line_start(data, t * len / THREADS);
-                    let b = line_start(data, (t + 1) * len / THREADS);
-                    let mut table = Table::new();
-                    let mut hours: Vec<Bucket<T>> = (0..HOURS).map(|_| Bucket::default()).collect();
-                    let mut overflow = false;
-                    // Hour of the previous line: bytes 5..13 (`MM-DDTHH`) nearly always repeat.
-                    let (mut key, mut h) = (0u64, 0);
-                    for_each_line(data, a, b, |_, l| {
-                        if l[5..13] != key.to_le_bytes() {
-                            (key, h) = (u64::from_le_bytes(l[5..13].try_into().unwrap()), hour_of(l));
-                        }
-                        let (ep, is_err, latency) = parse_rest(l);
-                        let Ok(id) = T::try_from(table.id(ep) << 1 | is_err as usize) else {
-                            overflow = true;
-                            return;
-                        };
-                        // SAFETY: the spec puts every timestamp inside the 72 hours, so h < HOURS.
-                        let bucket = unsafe { hours.get_unchecked_mut(h) };
-                        bucket.ids.push(id);
-                        bucket.lat.push(latency);
-                    });
-                    (table, hours, overflow)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // Hours present in each block, as two 64-bit halves of a 72-bit mask.
+    let blocks = (len >> BLOCK_SHIFT) + 1;
+    let masks: Vec<[AtomicU64; 2]> = (0..blocks).map(|_| Default::default()).collect();
+    let has = |b: usize, h: usize| masks[b][h / 64].load(Relaxed) >> (h % 64) & 1 != 0;
+    let spin = Spin { arrived: AtomicUsize::new(0), round: AtomicUsize::new(0) };
+    let global = Mutex::new(Table::new()); // every endpoint seen so far; id = global id
+    let names = Shared(UnsafeCell::new(Table::new())); // a copy, read while nobody inserts
+    let order = Shared(UnsafeCell::new(Vec::<usize>::new())); // rank -> global id, by name
+    // Per thread and global id: lines this hour (then the thread's write cursor), 5xx lines.
+    let counts: Vec<_> = (0..THREADS).map(|_| Shared(UnsafeCell::new((vec![0u32; 0], vec![0u32; 0])))).collect();
+    let ranks = Shared(UnsafeCell::new((vec![0u32; 0], vec![0u32; 0]))); // per rank: start, 5xx
+    let lat = Shared(UnsafeCell::new(vec![0u32; 0])); // the hour's latencies, grouped by rank
+    let parts: Vec<AtomicUsize> = (0..THREADS).map(|_| AtomicUsize::new(0)).collect();
 
-    // Names: dedupe all threads' endpoints through one table, sort the distinct ones, and map
-    // every thread's local ids to the sorted position.
-    if parsed.iter().any(|p| p.2) {
-        return false;
-    }
-    let mut all = Table::new();
-    for (table, _, _) in &parsed {
-        for k in (0..table.spans.len()).map(|i| table.key(i)) {
-            all.id(k);
-        }
-    }
-    if T::try_from(all.spans.len() << 1).is_err() {
-        return false;
-    }
-    let mut order: Vec<usize> = (0..all.spans.len()).collect();
-    order.sort_unstable_by_key(|&i| all.key(i));
-    let mut global_rank = vec![0u32; order.len()];
-    for (r, &i) in order.iter().enumerate() {
-        global_rank[i] = r as u32;
-    }
-    let mut rank = Vec::new();
-    let mut by_hour: Vec<Mutex<Vec<Bucket<T>>>> = (0..HOURS).map(|_| Mutex::default()).collect();
-    for (table, hours, _) in parsed {
-        let local = (0..table.spans.len()).map(|i| global_rank[all.id(table.key(i))]);
-        rank.push(local.collect::<Vec<u32>>());
-        for (h, b) in hours.into_iter().enumerate() {
-            by_hour[h].get_mut().unwrap().push(b);
-        }
-    }
-    let names: Vec<&[u8]> = order.iter().map(|&i| all.key(i)).collect();
-
-    // Finish: hours handed out in increasing order, so the writer rarely has to wait.
-    let next_hour = AtomicUsize::new(0);
-    // Hours finish out of order. Each finished hour waits in `pending` until every earlier hour
-    // has claimed its place, so file offsets go out in output order: (next hour, its offset).
-    let out = Mutex::new((0, 0, vec![None; HOURS]));
     thread::scope(|s| {
-        for _ in 0..THREADS {
-            s.spawn(|| {
-                let (mut count, mut lat) = (Vec::new(), Vec::new());
-                loop {
-                    let h = next_hour.fetch_add(1, Relaxed);
-                    if h >= HOURS {
-                        break;
+        for t in 0..THREADS {
+            let (masks, has, spin, global, names, order) = (&masks, &has, &spin, &global, &names, &order);
+            let (counts, ranks, lat, parts, file) = (&counts, &ranks, &lat, &parts, &file);
+            s.spawn(move || {
+                // Pass 1: this thread's chunk. A line belongs to the block its first byte is in.
+                let (a, b) = (line_start(data, t * len / THREADS), line_start(data, (t + 1) * len / THREADS));
+                let (mut cur, mut m) = (a >> BLOCK_SHIFT, 0u128);
+                let (mut key, mut bit) = (0, 0); // hour of the previous line, usually the same
+                let flush = |b: usize, m: u128| {
+                    masks[b][0].fetch_or(m as u64, Relaxed);
+                    masks[b][1].fetch_or((m >> 64) as u64, Relaxed);
+                };
+                for_each_line(data, a, b, |off, l| {
+                    if off >> BLOCK_SHIFT != cur {
+                        flush(cur, m);
+                        (cur, m) = (off >> BLOCK_SHIFT, 0);
                     }
-                    let buckets = std::mem::take(&mut *by_hour[h].lock().unwrap());
-                    let buf = format_hour(h, buckets, &rank, &names, &mut count, &mut lat);
-                    // Under the lock only claim file offsets; the writes themselves run unlocked.
-                    let mut ready = Vec::new();
-                    {
-                        let (next, offset, pending) = &mut *out.lock().unwrap();
-                        pending[h] = Some(buf);
-                        while let Some(done) = pending.get_mut(*next).and_then(Option::take) {
-                            *offset += done.len() as u64;
-                            ready.push((*offset - done.len() as u64, done));
-                            *next += 1;
+                    if hour_key(l) != key {
+                        (key, bit) = (hour_key(l), 1 << hour_of(l));
+                    }
+                    m |= bit;
+                });
+                flush(cur, m);
+                spin.wait();
+
+                // Pass 2: all threads work on one hour at a time, in five phases.
+                let (mut table, mut to_global) = (Table::new(), Vec::new()); // local id cache
+                let (mut recs, mut buf, mut hour_off) = (Vec::new(), Vec::new(), 0u64);
+                for h in 0..HOURS {
+                    // 1. Parse every THREADS-th block holding hour h, counting per endpoint.
+                    // SAFETY: until phase 3, counts[t] is touched by thread t alone.
+                    let (cnt, err) = unsafe { counts[t].get() };
+                    cnt.fill(0);
+                    err.fill(0);
+                    let want = hour_key(hour_label(h).as_bytes());
+                    for b in (0..blocks).filter(|&b| has(b, h)).skip(t).step_by(THREADS) {
+                        let (from, to) = (line_start(data, b << BLOCK_SHIFT), line_start(data, (b + 1) << BLOCK_SHIFT));
+                        for_each_line(data, from, to, |_, l| {
+                            if hour_key(l) == want {
+                                let (ep, is_err, latency) = parse_rest(l);
+                                let id = table.id(ep);
+                                if id == to_global.len() {
+                                    to_global.push(global.lock().unwrap().id(ep));
+                                }
+                                let g = to_global[id];
+                                if g >= cnt.len() {
+                                    cnt.resize(g + 1, 0);
+                                    err.resize(g + 1, 0);
+                                }
+                                cnt[g] += 1;
+                                err[g] += is_err as u32;
+                                recs.push((g as u32, latency));
+                            }
+                        });
+                    }
+                    spin.wait();
+                    // 2. One thread: copy new names, sort them into the rank order, size arrays.
+                    if t == 0 {
+                        // SAFETY: every other thread waits at the next barrier.
+                        let (names, order, g) = unsafe { (names.get(), order.get(), global.lock().unwrap()) };
+                        while names.spans.len() < g.spans.len() {
+                            names.id(g.key(names.spans.len()));
+                        }
+                        // A few new names per hour after the first: insert each where it belongs.
+                        let e = names.spans.len();
+                        if e - order.len() > 64 {
+                            order.extend(order.len()..e);
+                            order.sort_unstable_by(|&a, &b| names.key(a).cmp(names.key(b)));
+                        }
+                        for g in order.len()..e {
+                            order.insert(order.partition_point(|&x| names.key(x) < names.key(g)), g);
+                        }
+                        for c in counts.iter().chain([ranks]) {
+                            let (x, y) = unsafe { c.get() };
+                            x.resize(e, 0);
+                            y.resize(e, 0);
                         }
                     }
-                    for (off, done) in ready {
-                        file.write_all_at(&done, off).unwrap();
+                    spin.wait();
+                    // 3. Thread t owns the ranks lo..hi: the total of its range, then offsets.
+                    // SAFETY: from here to the end of the hour, `order` and `names` are only read.
+                    let (order, names) = unsafe { (&*order.get(), &*names.get()) };
+                    let e = order.len();
+                    let (lo, hi) = (t * e / THREADS, (t + 1) * e / THREADS);
+                    let all = |g: usize, f: fn(&(Vec<u32>, Vec<u32>), usize) -> u32| -> u32 {
+                        counts.iter().map(|c| f(unsafe { c.get() }, g)).sum()
+                    };
+                    let mine: u32 = order[lo..hi].iter().map(|&g| all(g, |c, g| c.0[g])).sum();
+                    parts[t].store(mine as usize, Relaxed);
+                    spin.wait();
+                    let total: usize = parts.iter().map(|p| p.load(Relaxed)).sum();
+                    let mut pos = parts[..t].iter().map(|p| p.load(Relaxed)).sum::<usize>() as u32;
+                    // SAFETY: thread t writes only the entries of its own ranks; lat is sized by
+                    // thread 0 while the others are still here, before anyone writes into it.
+                    let (start, errs) = unsafe { ranks.get() };
+                    if t == 0 {
+                        unsafe { lat.get().resize(total, 0) };
                     }
+                    for r in lo..hi {
+                        let g = order[r];
+                        start[r] = pos;
+                        errs[r] = all(g, |c, g| c.1[g]);
+                        for c in counts {
+                            let c = unsafe { &mut c.get().0[g] };
+                            (*c, pos) = (pos, pos + *c);
+                        }
+                    }
+                    spin.wait();
+                    // 4. Every thread scatters its own lines through its own cursors.
+                    // SAFETY: the cursors of different (thread, endpoint) pairs cover disjoint
+                    // ranges of the hour buffer, which holds exactly `total` lines.
+                    let out = unsafe { lat.get() };
+                    for &(g, v) in &recs {
+                        unsafe {
+                            let c = counts[t].get().0.get_unchecked_mut(g as usize);
+                            *out.get_unchecked_mut(*c as usize) = v;
+                            *c += 1;
+                        }
+                    }
+                    recs.clear();
+                    spin.wait();
+                    // 5. Format this thread's ranks, then write them after the earlier ranges.
+                    let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap();
+                    for r in lo..hi {
+                        let (a, b) = (start[r] as usize, if r + 1 < e { start[r + 1] as usize } else { total });
+                        if a == b {
+                            continue;
+                        }
+                        // SAFETY: rank ranges are disjoint, and this thread owns ranks lo..hi.
+                        let v = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().add(a), b - a) };
+                        let n = v.len();
+                        buf.extend_from_slice(&prefix);
+                        buf.extend_from_slice(names.key(order[r]));
+                        buf.push(b' ');
+                        put_num(&mut buf, n as u64, b' ');
+                        // Small groups (most of them, in the Zipf tail): one sort beats three selects.
+                        if n <= 32 {
+                            v.sort_unstable();
+                        }
+                        let mut lo = 0;
+                        for p in [50, 95, 99] {
+                            let k = (p * n + 99) / 100 - 1;
+                            let x = if n <= 32 { v[k] } else { *v[lo..].select_nth_unstable(k - lo).1 };
+                            put_num(&mut buf, x as u64, b' ');
+                            lo = k;
+                        }
+                        let errs = errs[r] as u64;
+                        put_num(&mut buf, errs, b' ');
+                        put_num(&mut buf, errs * 1_000_000 / n as u64, b'\n');
+                    }
+                    parts[t].store(buf.len(), Relaxed);
+                    spin.wait();
+                    let before = parts[..t].iter().map(|p| p.load(Relaxed) as u64).sum::<u64>();
+                    file.write_all_at(&buf, hour_off + before).unwrap();
+                    hour_off += parts.iter().map(|p| p.load(Relaxed) as u64).sum::<u64>();
+                    buf.clear();
+                    spin.wait(); // `parts` is reused in the next hour
                 }
             });
         }
     });
-    true
 }
