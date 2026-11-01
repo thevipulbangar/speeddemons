@@ -21,6 +21,8 @@ noise. Points use the scoring formula against the reference row.
 | - | Board check of an earlier commit (5844050) | run-bcc760902372 | 0.3525 | 65.9 | 61.2 |
 | - | Board check of step 10 (commit 12c5e52) | run-8fc234f45457 | 0.302 | 59.9 | |
 | 11 | Bidirectional Dijkstra on one edge array: each 8-byte entry carries the reverse weight too, one-way in-edges in a small side list; expand the side with fewer queued entries | local | 0.21 | 69 | |
+| - | Board check of step 11 (commit f5bafe8) | run-5576cee086c5 | 0.2129 | 69.8 | 65.2 |
+| 12 | Trim: the u64 fallback reuses the generic bidirectional search, one parse loop instead of two | local | 0.21 | 71 | |
 
 Step 11: the bidirectional search idea, alternating by queue size and storing the reverse
 weight next to the forward one, was seen in public repos manusingh090/speed-demon-2026-entry
@@ -45,3 +47,4 @@ and Harini-vm/speed-demon-harini; the code here is written from scratch. Query p
 | 4-byte arcs (i16 head delta + u16 weight; 0.7% escaped to a slot-keyed table), repacked in place | Repack costs ~20 ms and queries were not faster. Dropped. |
 | MADV_HUGEPAGE on the big buffers before first touch (second try, query phase isolated) | Query phase within noise, build slower. Dropped. |
 | Longest-first / balance check | Not needed: all 12 query threads finish within ~4% of each other. |
+| Removing the third text parse | Every variant needs the weights from somewhere: keeping them in the first CSR and gathering costs +20 MB (step 3 notes), so the parse stays. |

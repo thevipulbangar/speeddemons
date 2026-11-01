@@ -118,14 +118,9 @@ impl Edges {
         // A line is at most 3 * 11 bytes, so lines starting before `safe` have 8 bytes of
         // slack after every number and can use fast_num.
         let safe = end.min(d.len().saturating_sub(40));
-        while p < safe {
-            let (u, v, w) = (fast_num(d, &mut p), fast_num(d, &mut p), fast_num(d, &mut p));
-            if u != v {
-                f(u as usize, v as usize, w);
-            }
-        }
         while p < end {
-            let (u, v, w) = (num(d, &mut p), num(d, &mut p), num(d, &mut p));
+            let rd = if p < safe { fast_num } else { num };
+            let (u, v, w) = (rd(d, &mut p), rd(d, &mut p), rd(d, &mut p));
             if u != v {
                 f(u as usize, v as usize, w);
             }
@@ -619,50 +614,12 @@ impl<D: Dist> Search<D> {
         }
         ok
     }
-
-    /// Dijkstra from s, stopped when t is settled. Returns INF if t is unreachable, or None
-    /// if some tentative distance does not fit in D (the caller then retries with u64).
-    fn run(&mut self, g: &Graph, s: usize, t: usize) -> Option<u64> {
-        for &b in &self.blocks {
-            self.dir[b as usize] = NONE;
-        }
-        self.blocks.clear();
-        self.pool.clear();
-        self.heap.clear();
-        *self.dist(s) = D::narrow(0);
-        self.heap.push(0, s as u32);
-        while let Some((du, u)) = self.heap.pop() {
-            let u = u as usize;
-            if du > self.dist(u).wide() {
-                continue; // stale entry
-            }
-            if u == t {
-                return Some(du);
-            }
-            for &e in &g.edges[g.off[u] as usize..g.off[u + 1] as usize] {
-                let v = e.head;
-                let w = if e.w as u64 == ESCAPE { g.heavy(u as u32, v) } else { e.w as u64 };
-                let nd = du + w;
-                if nd >= D::INF.wide() {
-                    return None; // only heavy edges get here; rare
-                }
-                let dv = self.dist(v as usize);
-                if nd < dv.wide() {
-                    *dv = D::narrow(nd);
-                    self.heap.push(nd, v);
-                    // v will be popped soon: start fetching its edge row now.
-                    unsafe { prefetch(g.edges.as_ptr().add(*g.off.get_unchecked(v as usize) as usize)) };
-                }
-            }
-        }
-        Some(INF)
-    }
 }
 
 /// Bidirectional Dijkstra. Each step expands the side with fewer queued entries (a near
 /// 2^32 first edge would make key-based alternation flood one side); it stops once the two
-/// smallest keys add up to the best meeting distance. None if a distance overflows u32.
-fn bidi(f: &mut Search<u32>, b: &mut Search<u32>, g: &Graph, s: usize, t: usize) -> Option<u64> {
+/// smallest keys add up to the best meeting distance. None if a distance overflows D.
+fn bidi<D: Dist>(f: &mut Search<D>, b: &mut Search<D>, g: &Graph, s: usize, t: usize) -> Option<u64> {
     f.reset(s);
     b.reset(t);
     let mut best = INF;
@@ -709,12 +666,12 @@ fn main() {
     let next = AtomicUsize::new(0);
     par(|_| {
         let (mut fw, mut bw) = (Search::<u32>::new(n), Search::<u32>::new(n));
-        let mut wide: Option<Search<u64>> = None;
+        let mut wide: Option<(Search<u64>, Search<u64>)> = None;
         while let Some((a, b, ans)) = queries.get(next.fetch_add(1, Relaxed)) {
             if ans.load(Relaxed) == TODO {
                 let d = bidi(&mut fw, &mut bw, &g, *a, *b).unwrap_or_else(|| {
-                    let w = wide.get_or_insert_with(|| Search::new(n));
-                    w.run(&g, *a, *b).unwrap()
+                    let (f, w) = wide.get_or_insert_with(|| (Search::new(n), Search::new(n)));
+                    bidi(f, w, &g, *a, *b).unwrap()
                 });
                 ans.store(d, Relaxed);
             }
