@@ -21,6 +21,7 @@ use std::thread;
 const NONE: u32 = u32::MAX;
 const DENSE: u32 = 1 << 31;
 const SPARSE: u32 = NONE - 1;
+const CONT: u32 = 1 << 31;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -99,66 +100,63 @@ impl Map {
     }
 }
 
-/// Query terms, each with a dense id. Slots hold the id plus 12 more bits of the hash, so a
-/// token that is not a query term (one in five) is almost always rejected inside the 512 KB
-/// slot array without touching the per-term arrays.
+/// One lexicon slot: the term's tag, id and kind (NONE: phrases only, SPARSE: doc list,
+/// DENSE | i: bitmap i), so a corpus token costs one cache line to look up.
+#[derive(Clone, Copy)]
+struct Slot {
+    tag: u64,
+    id: u32,
+    kind: u32,
+}
+
+const EMPTY: Slot = Slot { tag: 0, id: NONE, kind: NONE };
+
+/// Query terms, each with a dense id.
 struct Lexicon {
-    slots: Vec<u32>,
-    tags: Vec<u64>,
+    slots: Vec<Slot>,
     keys: Vec<Key>,
 }
 
-const ID_BITS: u32 = 20;
-
 impl Lexicon {
+    fn new() -> Lexicon {
+        Lexicon { slots: vec![EMPTY; 1024], keys: Vec::new() }
+    }
+    /// The slot of term k, EMPTY when k is not a query term.
     #[inline(always)]
-    fn find(&self, k: &Key) -> u32 {
+    fn find(&self, k: &Key) -> Slot {
         let tag = tag(k);
-        let h = tag.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mask = self.slots.len() - 1;
-        let mut i = (h >> 32) as usize & mask;
+        let mut i = (tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
         loop {
             let s = self.slots[i];
-            if s == NONE {
-                return NONE;
-            }
-            let id = s & ((1 << ID_BITS) - 1);
-            if s >> ID_BITS == (h >> 52) as u32
-                && self.tags[id as usize] == tag
-                && (tag >> 63 == 0 || self.keys[id as usize] == *k)
-            {
-                return id;
+            if s.id == NONE || (s.tag == tag && (tag >> 63 == 0 || self.keys[s.id as usize] == *k)) {
+                return s;
             }
             i = (i + 1) & mask;
         }
     }
     fn insert(&mut self, id: u32) {
-        let h = self.tags[id as usize].wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let tag = tag(&self.keys[id as usize]);
         let mask = self.slots.len() - 1;
-        let mut i = (h >> 32) as usize & mask;
-        while self.slots[i] != NONE {
+        let mut i = (tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+        while self.slots[i].id != NONE {
             i = (i + 1) & mask;
         }
-        self.slots[i] = ((h >> 52) as u32) << ID_BITS | id;
-    }
-    fn new() -> Lexicon {
-        Lexicon { slots: vec![NONE; 1024], tags: Vec::new(), keys: Vec::new() }
+        self.slots[i] = Slot { tag, id, kind: NONE };
     }
     fn id(&mut self, term: &[u8]) -> u32 {
         let k = key_of(term);
-        let id = self.find(&k);
-        if id != NONE {
-            return id;
+        let s = self.find(&k);
+        if s.id != NONE {
+            return s.id;
         }
         self.push(k)
     }
     fn push(&mut self, k: Key) -> u32 {
         let id = self.keys.len() as u32;
-        assert!(id < (1 << ID_BITS) - 1, "too many query terms");
         self.keys.push(k);
-        self.tags.push(tag(&k));
-        if self.keys.len() * 10 >= self.slots.len() * 7 {
-            self.slots = vec![NONE; self.slots.len() * 2];
+        if self.keys.len() * 10 >= self.slots.len() * 6 {
+            self.slots = vec![EMPTY; self.slots.len() * 2];
             (0..self.keys.len() as u32).for_each(|i| self.insert(i));
         } else {
             self.insert(id);
@@ -169,7 +167,7 @@ impl Lexicon {
 
 /// Aho-Corasick over term ids. State 0 is the root; a phrase is identified by its final state.
 struct Automaton {
-    root: Vec<u32>, // root transitions by term id, 0 = none
+    root: Vec<u32>, // root transitions by term id, 0 = none; CONT if the term is ever 2nd+ in a phrase
     goto: Map,      // (state, term) -> state for every other state
     fail: Vec<u32>,
     out: Vec<u32>, // nearest proper suffix state that ends a phrase, 0 = none
@@ -180,12 +178,16 @@ impl Automaton {
     #[inline(always)]
     fn edge(&self, s: u32, t: u32) -> u32 {
         if s == 0 {
-            return self.root[t as usize];
+            return self.root[t as usize] & !CONT;
         }
         self.goto.find((s as u64) << 32 | t as u64, |_| true)
     }
     #[inline(always)]
     fn step(&self, mut s: u32, t: u32) -> u32 {
+        let r = self.root[t as usize];
+        if r & CONT == 0 {
+            return r; // only the root has an edge on t
+        }
         loop {
             let n = self.edge(s, t);
             if s == 0 || n != NONE {
@@ -227,6 +229,7 @@ impl Automaton {
             a.end[s as usize] = true;
             ends.push(s);
         }
+        phrases.iter().flat_map(|p| &p[1..]).for_each(|&t| a.root[t as usize] |= CONT);
         // Fail links in breadth-first order: a state is deeper than its parent.
         let mut depth = vec![0u32; parent.len()];
         for s in 1..parent.len() {
@@ -278,11 +281,11 @@ fn masks(data: &[u8], p: usize) -> (u64, u64) {
     }
 }
 
-/// Calls `f(doc, term id or NONE)` for every token of the lines in data[start..end].
+/// Calls `f(doc, lexicon slot)` for every token of the lines in data[start..end].
 /// Works on 64-byte blocks: token starts, token lengths and line ends all come out of
 /// the blocks' bit masks, so the inner loop runs once per token with no per-byte work.
 #[inline(always)]
-fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMut(u32, u32)) {
+fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMut(u32, Slot)) {
     const PREFIX: [u8; 64] = {
         let mut m = [0u8; 64];
         let mut i = 0;
@@ -316,7 +319,7 @@ fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMu
                 doc = data[p..p + len].iter().fold(0, |a, &c| a * 10 + (c - b'0') as u32);
                 want_id = false;
             } else if len > 32 {
-                f(doc, NONE); // longer than any query term
+                f(doc, EMPTY); // longer than any query term
             } else {
                 let mut k: Key = [0; 4];
                 // SAFETY: PREFIX[32 - len..] has 32 readable bytes; k is 32 bytes.
@@ -431,7 +434,6 @@ fn main() {
         mallopt(-3, 1 << 30);
     }
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
-    let t0 = std::time::Instant::now(); // TIMING
 
     // Parse queries. Every term gets a lexicon id; phrases go into the automaton.
     let mut lex = Lexicon::new();
@@ -455,14 +457,14 @@ fn main() {
             queries.push(Query::Phrase(phrases.len() as u32 - 1));
         }
     }
-    eprint!("L449:{:?} ", t0.elapsed()); // TIMING
     // Sample the first megabyte of the corpus. Its document frequencies decide which BOOL
     // terms get a bitmap, and the terms are renumbered by them so the few thousand terms
     // that make up most tokens share the same cache lines in every per-term array.
     let mut sdf = vec![(NONE, 0u32); lex.keys.len()];
     let mut sdocs = 0;
-    tokens(docs, 0, line_start(docs, docs.len().min(1 << 20)), &lex, |d, t| {
+    tokens(docs, 0, line_start(docs, docs.len().min(1 << 20)), &lex, |d, s| {
         sdocs = d + 1;
+        let t = s.id;
         if t != NONE && sdf[t as usize].0 != d {
             sdf[t as usize] = (d, sdf[t as usize].1 + 1);
         }
@@ -495,9 +497,10 @@ fn main() {
             }
         }
     }
-    eprint!("L488:{:?} ", t0.elapsed()); // TIMING
+    for s in lex.slots.iter_mut().filter(|s| s.id != NONE) {
+        s.kind = kind[s.id as usize];
+    }
     let (ac, ends) = Automaton::build(nterms, &phrases);
-    eprint!("L489:{:?} ", t0.elapsed()); // TIMING
 
     // Document count from the last line's id.
     let last_line = docs[..docs.len().saturating_sub(1)].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
@@ -524,7 +527,8 @@ fn main() {
                     let mut last_end = vec![NONE; ac.fail.len()];
                     let mut hits = Vec::new();
                     let (mut prev, mut state, mut marked) = (NONE, 0u32, false);
-                    tokens(docs, a, b, lex, |d, t| {
+                    tokens(docs, a, b, lex, |d, s| {
+                        let t = s.id;
                         if d != prev {
                             (prev, state, marked) = (d, 0, false);
                         }
@@ -532,7 +536,7 @@ fn main() {
                             state = 0;
                             return;
                         }
-                        let (ti, k) = (t as usize, kind[t as usize]);
+                        let (ti, k) = (t as usize, s.kind);
                         if k != NONE && seen[ti] != d {
                             seen[ti] = d;
                             if k == SPARSE {
@@ -581,7 +585,6 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    eprint!("L572:{:?} ", t0.elapsed()); // TIMING
     let mut matches: Vec<Vec<u32>> = vec![Vec::new(); ac.fail.len()];
     chunks.iter().flat_map(|c| &c.hits).for_each(|&(e, d)| matches[e as usize].push(d));
 
@@ -619,6 +622,7 @@ fn main() {
                             };
                             // The running result is a sorted list, or the bitmap r when `bits`.
                             let mut bits = false;
+                            cur.clear();
                             for (i, &(op, t)) in terms.iter().enumerate() {
                                 let k = kind[t as usize];
                                 let dense = k != SPARSE;
@@ -673,7 +677,6 @@ fn main() {
             .collect();
         hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
-    eprint!("L655:{:?} ", t0.elapsed()); // TIMING
     blocks.sort_unstable_by_key(|b| b.0);
     let out: String = blocks.into_iter().map(|b| b.1).collect();
     std::fs::create_dir_all(out_dir).ok();
