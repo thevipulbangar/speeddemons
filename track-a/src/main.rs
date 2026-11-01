@@ -114,8 +114,8 @@ fn parse_rest(l: &[u8]) -> (&[u8], bool, u32) {
         let lanes = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         let keep = _mm_cmpgt_epi8(lanes, _mm_set1_epi8(last as i8));
         let d = _mm_and_si128(_mm_sub_epi8(tail, _mm_set1_epi8(b'0' as i8)), keep);
-        let d2 = _mm_maddubs_epi16(d, _mm_set_epi8(1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10));
-        let d4 = _mm_madd_epi16(d2, _mm_set_epi16(1, 100, 1, 100, 1, 100, 1, 100));
+        let d2 = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A)); // byte pairs: 10 * a + b
+        let d4 = _mm_madd_epi16(d2, _mm_set1_epi32(0x0001_0064)); // pairs: 100 * a + b
         let g: [u32; 4] = std::mem::transmute(d4);
         let lat = (g[1] as u64 * 100_000_000 + g[2] as u64 * 10_000 + g[3] as u64) as u32;
         (&l[ep..sp - 4], l[sp - 3] == b'5', lat)
@@ -128,9 +128,10 @@ fn parse_rest(l: &[u8]) -> (&[u8], bool, u32) {
 unsafe fn same(a: *const u8, b: *const u8, n: usize) -> bool {
     let mut i = 0;
     while i < n {
-        let (x, y) = (_mm256_loadu_si256(a.add(i) as *const __m256i), _mm256_loadu_si256(b.add(i) as *const __m256i));
+        let x = _mm256_loadu_si256(a.add(i) as *const __m256i);
+        let y = _mm256_loadu_si256(b.add(i) as *const __m256i);
         let equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32;
-        let wanted = if n - i >= 32 { u32::MAX } else { (1 << (n - i)) - 1 };
+        let wanted = u32::MAX >> 32usize.saturating_sub(n - i); // the bytes before n
         if !equal & wanted != 0 {
             return false;
         }
@@ -305,14 +306,6 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
     buf
 }
 
-/// Hours finish out of order. Each finished hour waits here until every earlier hour has
-/// claimed its place in the file, so file offsets are handed out in output order.
-struct Output {
-    next: usize,
-    offset: u64,
-    pending: Vec<Option<Vec<u8>>>,
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", String::as_str);
@@ -333,7 +326,8 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
                 s.spawn(move || {
-                    let (a, b) = (line_start(data, t * len / THREADS), line_start(data, (t + 1) * len / THREADS));
+                    let a = line_start(data, t * len / THREADS);
+                    let b = line_start(data, (t + 1) * len / THREADS);
                     let mut table = Table::new();
                     let mut hours: Vec<Bucket<T>> = (0..HOURS).map(|_| Bucket::default()).collect();
                     let mut overflow = false;
@@ -376,7 +370,8 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
     let mut rank = Vec::new();
     let mut by_hour: Vec<Mutex<Vec<Bucket<T>>>> = (0..HOURS).map(|_| Mutex::default()).collect();
     for (table, hours, _) in parsed {
-        rank.push((0..table.spans.len()).map(|i| global_rank[all.id(table.key(i))]).collect::<Vec<u32>>());
+        let local = (0..table.spans.len()).map(|i| global_rank[all.id(table.key(i))]);
+        rank.push(local.collect::<Vec<u32>>());
         for (h, b) in hours.into_iter().enumerate() {
             by_hour[h].get_mut().unwrap().push(b);
         }
@@ -385,7 +380,9 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
 
     // Finish: hours handed out in increasing order, so the writer rarely has to wait.
     let next_hour = AtomicUsize::new(0);
-    let out = Mutex::new(Output { next: 0, offset: 0, pending: vec![None; HOURS] });
+    // Hours finish out of order. Each finished hour waits in `pending` until every earlier hour
+    // has claimed its place, so file offsets go out in output order: (next hour, its offset).
+    let out = Mutex::new((0, 0, vec![None; HOURS]));
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
@@ -400,14 +397,12 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                     // Under the lock only claim file offsets; the writes themselves run unlocked.
                     let mut ready = Vec::new();
                     {
-                        let mut o = out.lock().unwrap();
-                        o.pending[h] = Some(buf);
-                        while o.next < HOURS {
-                            let i = o.next;
-                            let Some(done) = o.pending[i].take() else { break };
-                            ready.push((o.offset, done));
-                            o.offset += ready.last().unwrap().1.len() as u64;
-                            o.next += 1;
+                        let (next, offset, pending) = &mut *out.lock().unwrap();
+                        pending[h] = Some(buf);
+                        while let Some(done) = pending.get_mut(*next).and_then(Option::take) {
+                            *offset += done.len() as u64;
+                            ready.push((*offset - done.len() as u64, done));
+                            *next += 1;
                         }
                     }
                     for (off, done) in ready {
