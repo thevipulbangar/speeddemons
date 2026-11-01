@@ -48,3 +48,9 @@ and Harini-vm/speed-demon-harini; the code here is written from scratch. Query p
 | MADV_HUGEPAGE on the big buffers before first touch (second try, query phase isolated) | Query phase within noise, build slower. Dropped. |
 | Longest-first / balance check | Not needed: all 12 query threads finish within ~4% of each other. |
 | Removing the third text parse | Every variant needs the weights from somewhere: keeping them in the first CSR and gathering costs +20 MB (step 3 notes), so the parse stays. |
+
+Step 13, PGO: built with `-Cprofile-generate` in the allowlisted image
+`halloumee/speed-demon-rust:1.99.1-trixie-llvm-tools` (rustc 1.99.1, LLVM 23.1.1), ran three
+times on the full dataset, merged with that image's `llvm-profdata` into `pgo.profdata`, and
+built with `-Cprofile-use`. Interleaved A/B, 8 runs each: median wall 211 -> 209 ms,
+instructions 6.44e9 -> 6.23e9 (-3.2%). A small win, kept.
