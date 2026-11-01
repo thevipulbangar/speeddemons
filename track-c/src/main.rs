@@ -17,20 +17,18 @@
 //! 3. names_distinct is exact. A lock-free hash table shared by all threads holds every name
 //!    once; a slot is 16 bytes, the length and up to 15 name bytes, so a lookup is one 16-byte
 //!    compare and the slot index is the name's id. Longer names keep their bytes in an arena.
-//!    The parse sends `(id, group)` pairs in small buffers to the thread that owns the id
-//!    (`id % threads`), which sets bits in its private bitset between batches. No hot cache
-//!    line is written by two threads.
+//!    Each id has a shared row of 256 bits, one per group, set with a load and, only if the bit
+//!    is still clear, a `fetch_or`; the row is prefetched for writing along with the slot.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex};
+use std::sync::Barrier;
 use std::thread;
 
 const CODES: usize = 26 * 26 * 26; // [A-Z]{3}
 const BATCH: usize = 16; // records parsed ahead of their table lookups
-const MAIL: usize = 1024; // pairs per buffer sent to an owner
 const PENDING: u64 = 0x80; // in a slot's first byte while its second word is being written
 const LONG: u64 = 0x7F; // first byte of a slot whose name lives in the arena
 
@@ -317,8 +315,7 @@ struct Ctx<'a> {
     groups: usize,
     threads: usize,
     names: Names,
-    inbox: Vec<Mutex<Vec<Vec<u32>>>>, // per owner: full pair buffers
-    waiting: Vec<AtomicBool>,
+    seen: &'a [AtomicU64], // 4 words per name id: one bit per group that had the name
     barrier: Barrier,
 }
 
@@ -367,19 +364,6 @@ fn worker(c: &Ctx, k: usize, start: usize, end: usize, load_regions: bool) -> Pa
         let a = start & !4095;
         unsafe { madvise(d.as_ptr().add(a), end - a, 22) };
     }
-    // We own the name ids in [lo, ..): ids are split into equal ranges, owner = id * threads >> bits.
-    let lo = (k << c.names.bits).div_ceil(c.threads);
-    let rows = (1usize << c.names.bits) / c.threads + 1;
-    let mut bits = vec![[0u64; 4]; rows]; // (name id / threads, group) for the ids we own
-    let take_mail = |bits: &mut Vec<[u64; 4]>| {
-        c.waiting[k].store(false, Relaxed);
-        for buf in std::mem::take(&mut *c.inbox[k].lock().unwrap()) {
-            for v in buf {
-                bits[(v >> 8) as usize - lo][(v as usize & 255) / 64] |= 1 << (v % 64);
-            }
-        }
-    };
-    let mut out: Vec<Vec<u32>> = (0..c.threads).map(|_| Vec::with_capacity(MAIL)).collect();
     let mut aggs = vec![EMPTY; c.groups];
     let mut batch = Vec::with_capacity(BATCH);
     let mut p = start;
@@ -396,6 +380,9 @@ fn worker(c: &Ctx, k: usize, start: usize, end: usize, load_regions: bool) -> Pa
                 unsafe { _mm_prefetch(g as *const _ as *const i8, _MM_HINT_T0) };
             }
             c.names.prefetch(&r.key);
+            // The (name, group) bits usually sit next to the home slot's row: fetch that line for writing.
+            let row = &c.seen[4 * c.names.home(r.key.h)];
+            unsafe { _mm_prefetch(row as *const _ as *const i8, _MM_HINT_ET0) };
             batch.push(r);
             p = q;
         }
@@ -413,26 +400,20 @@ fn worker(c: &Ctx, k: usize, start: usize, end: usize, load_regions: bool) -> Pa
                 ok = false;
                 break 'parse;
             };
-            let owner = (id as usize * c.threads) >> c.names.bits;
-            out[owner].push(id << 8 | g as u32);
-            if out[owner].len() == MAIL {
-                c.inbox[owner].lock().unwrap().push(std::mem::replace(&mut out[owner], Vec::with_capacity(MAIL)));
-                c.waiting[owner].store(true, Relaxed);
+            let w = &c.seen[4 * id as usize + g as usize / 64];
+            if w.load(Relaxed) & 1 << (g % 64) == 0 {
+                w.fetch_or(1 << (g % 64), Relaxed);
             }
         }
-        if c.waiting[k].load(Relaxed) {
-            take_mail(&mut bits);
-        }
-    }
-    for (owner, buf) in out.into_iter().enumerate() {
-        c.inbox[owner].lock().unwrap().push(buf);
     }
     c.barrier.wait();
-    take_mail(&mut bits);
+    // Count the bits of our share of the name rows.
+    let n = 1usize << c.names.bits;
+    let rows = n * k / c.threads..n * (k + 1) / c.threads;
     let mut distinct = vec![0u64; c.groups];
-    for row in &bits {
-        for (j, &w) in row.iter().enumerate() {
-            let mut w = w;
+    for row in c.seen[4 * rows.start..4 * rows.end].chunks(4) {
+        for (j, w) in row.iter().enumerate() {
+            let mut w = w.load(Relaxed);
             while w != 0 {
                 distinct[j * 64 + w.trailing_zeros() as usize] += 1;
                 w &= w - 1;
@@ -513,8 +494,7 @@ fn main() {
         groups,
         threads,
         names: Names::new(bits, d.len()),
-        inbox: (0..threads).map(|_| Mutex::new(Vec::new())).collect(),
-        waiting: (0..threads).map(|_| AtomicBool::new(false)).collect(),
+        seen: anon(4 << bits),
         barrier: Barrier::new(threads),
     };
     let mut result = run(&ctx(17, groups), &starts, true);
