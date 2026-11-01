@@ -13,7 +13,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Barrier, Mutex};
+use std::sync::{Barrier, Condvar, Mutex};
 use std::thread;
 
 const HOURS: usize = 72; // 2026-10-30T18 .. 2026-11-02T17, fixed by the spec
@@ -92,6 +92,8 @@ fn hour_key(l: &[u8]) -> u64 {
     u64::from_le_bytes(l[5..13].try_into().unwrap())
 }
 
+const HOUR_LABEL_LEN: u64 = 21; // the length of an hour label below
+
 /// `YYYY-MM-DDTHH:00:00Z ` for hour index h, the start of every output line of that hour.
 fn hour_label(h: usize) -> String {
     let abs = 18 + h; // hours since 2026-10-30T00
@@ -148,21 +150,20 @@ unsafe fn same(a: *const u8, b: *const u8, n: usize) -> bool {
 /// Open-addressing endpoint -> dense id table, private to one thread. Key bytes are copied
 /// into one small arena, so probing touches a few hot cache lines instead of ~1,800 scattered
 /// places in the 239 MB mapping. A slot packs everything a lookup needs into one word:
-/// arena offset << 32 | length << 16 | id + 1 (0 = empty).
+/// arena offset << 32 | (id + 1) << 8 | length (0 = empty; endpoints are at most 125 bytes).
 struct Table {
     slots: Vec<u64>,
-    spans: Vec<(u32, u32)>, // id -> (start, end) in `arena`
-    arena: Vec<u8>,         // keys, each followed by 32 zero bytes of padding
+    keys: Vec<(&'static [u8], u32)>, // id -> (the name in the mapping, its arena offset)
+    arena: Vec<u8>,                  // key copies, each followed by 32 zero bytes of padding
 }
 
 impl Table {
     fn new() -> Self {
-        Table { slots: vec![0; 4096], spans: Vec::new(), arena: Vec::new() }
+        Table { slots: vec![0; 4096], keys: Vec::new(), arena: Vec::new() }
     }
 
-    fn key(&self, id: usize) -> &[u8] {
-        let (a, b) = self.spans[id];
-        &self.arena[a as usize..b as usize]
+    fn key(&self, id: usize) -> &'static [u8] {
+        self.keys[id].0
     }
 
     /// Hash from the first and last 8 bytes plus the length: no loop over the string.
@@ -180,7 +181,7 @@ impl Table {
     /// The id of `k`, which must be followed by 31 readable bytes (true for any endpoint
     /// in the padded mapping).
     #[inline(always)]
-    fn id(&mut self, k: &[u8]) -> usize {
+    fn id(&mut self, k: &'static [u8]) -> usize {
         let mask = self.slots.len() - 1;
         let mut i = Self::hash(k) & mask;
         loop {
@@ -188,37 +189,36 @@ impl Table {
             if s == 0 {
                 break;
             }
-            let (start, n) = ((s >> 32) as usize, (s >> 16) as u16 as usize);
+            let (start, n) = ((s >> 32) as usize, s as u8 as usize);
             if n == k.len() && unsafe { same(self.arena.as_ptr().add(start), k.as_ptr(), n) } {
-                return (s as u16 - 1) as usize;
+                return (s as u32 >> 8) as usize - 1;
             }
             i = (i + 1) & mask;
         }
         let start = self.arena.len();
         self.arena.extend_from_slice(k);
         self.arena.extend_from_slice(&[0; 32]);
-        self.spans.push((start as u32, (start + k.len()) as u32));
-        self.slots[i] = Self::slot(start, k.len(), self.spans.len());
-        if self.spans.len() * 2 > self.slots.len() {
+        self.keys.push((k, start as u32));
+        self.slots[i] = Self::slot(start, k.len(), self.keys.len());
+        if self.keys.len() * 2 > self.slots.len() {
             self.grow();
         }
-        self.spans.len() - 1
+        self.keys.len() - 1
     }
 
     fn slot(start: usize, len: usize, id1: usize) -> u64 {
-        (start as u64) << 32 | (len as u64) << 16 | id1 as u64
+        (start as u64) << 32 | (id1 as u64) << 8 | len as u64
     }
 
     fn grow(&mut self) {
         self.slots = vec![0; self.slots.len() * 2];
         let mask = self.slots.len() - 1;
-        for id in 0..self.spans.len() {
-            let mut i = Self::hash(self.key(id)) & mask;
+        for (id, &(k, start)) in self.keys.iter().enumerate() {
+            let mut i = Self::hash(k) & mask;
             while self.slots[i] != 0 {
                 i = (i + 1) & mask;
             }
-            let (a, b) = self.spans[id];
-            self.slots[i] = Self::slot(a as usize, (b - a) as usize, id + 1);
+            self.slots[i] = Self::slot(start as usize, k.len(), id + 1);
         }
     }
 }
@@ -238,103 +238,186 @@ fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
     buf.extend_from_slice(&tmp[i..]);
 }
 
+/// One output line before formatting: (hour, endpoint) group statistics.
+struct Row {
+    name: &'static [u8],
+    n: u32,
+    p: [u32; 3], // p50, p95, p99
+    errors: u32,
+}
+
+impl Row {
+    fn ppm(&self) -> u64 {
+        self.errors as u64 * 1_000_000 / self.n as u64
+    }
+
+    /// The formatted line's length, known without formatting it.
+    fn len(&self) -> u64 {
+        let digits = |v: u64| v.checked_ilog10().map_or(1, |d| d as u64 + 1);
+        let nums = [self.n, self.p[0], self.p[1], self.p[2], self.errors];
+        let total: u64 = nums.iter().map(|&v| digits(v as u64)).sum::<u64>() + digits(self.ppm());
+        HOUR_LABEL_LEN + self.name.len() as u64 + 1 + total + 6
+    }
+}
+
+/// Formats an hour's rows and writes them at `off`, through a small reused buffer.
+fn write_hour(file: &File, mut off: u64, h: usize, rows: &[Row], buf: &mut Vec<u8>) {
+    let prefix = hour_label(h);
+    for r in rows {
+        buf.extend_from_slice(prefix.as_bytes());
+        buf.extend_from_slice(r.name);
+        buf.push(b' ');
+        for v in [r.n, r.p[0], r.p[1], r.p[2], r.errors] {
+            put_num(buf, v as u64, b' ');
+        }
+        put_num(buf, r.ppm(), b'\n');
+        if buf.len() >= 1 << 15 {
+            file.write_all_at(buf, off).unwrap();
+            off += buf.len() as u64;
+            buf.clear();
+        }
+    }
+    file.write_all_at(buf, off).unwrap();
+    buf.clear();
+}
+
 /// Per-thread state for pass 2, reused from one hour to the next.
 #[derive(Default)]
 struct HourWork {
     table: Option<Table>,
-    order: Vec<usize>,  // endpoint ids sorted by name, i.e. output order
-    ids: Vec<u16>,      // this hour's lines: endpoint id ...
-    lines: Vec<u32>,    // ... and latency
-    counts: Vec<u32>,   // per id: lines this hour, then end cursor of its latency range
-    errors: Vec<u32>,   // per id: 5xx lines this hour
-    lat: Vec<u32>,      // this hour's latencies, grouped by endpoint in output order
+    order: Vec<usize>, // endpoint ids sorted by name, i.e. output order
+    recs: Vec<u64>,    // this hour's lines: endpoint id << 33 | latency << 1 | is_5xx
+    start: Vec<usize>, // per id: where its group begins in `recs` once grouped
+    next: Vec<usize>,  // per id: next slot of its group to fill while grouping
+    end: Vec<usize>,   // per id: where its group ends
 }
 
 impl HourWork {
     /// Parses every line of hour `h` in `data[start..end]`.
-    fn collect(&mut self, data: &[u8], start: usize, end: usize, h: usize) {
+    fn collect(&mut self, data: &'static [u8], start: usize, end: usize, h: usize) {
         let want = hour_key(hour_label(h).as_bytes());
         let table = self.table.get_or_insert_with(Table::new);
         for_each_line(data, start, end, |_, l| {
             if hour_key(l) == want {
                 let (ep, is_err, latency) = parse_rest(l);
-                let id = table.id(ep);
-                self.ids.push((id << 1 | is_err as usize) as u16);
-                self.lines.push(latency);
+                let id = table.id(ep) as u64;
+                self.recs.push(id << 33 | (latency as u64) << 1 | is_err as u64);
             }
         });
     }
 
-    /// Groups the collected lines by endpoint and appends the hour's output to `buf`.
-    fn finish(&mut self, h: usize, buf: &mut Vec<u8>) {
+    /// Groups the collected lines by endpoint into `rows`, in output order; returns their
+    /// formatted size in bytes.
+    fn finish(&mut self, rows: &mut Vec<Row>) -> u64 {
         // A thread that has not parsed a line yet has no table and nothing to write.
-        let Some(table) = self.table.as_ref() else { return };
-        let n = table.spans.len();
+        let Some(table) = self.table.as_ref() else { return 0 };
+        let n = table.keys.len();
         // Ids are handed out in first-seen order; keep `order` sorted as new names show up.
         // The old part is already sorted, so this is a cheap merge after the first hour.
         if self.order.len() < n {
             self.order.extend(self.order.len()..n);
             self.order.sort_by(|&a, &b| table.key(a).cmp(table.key(b)));
         }
-        self.counts.clear();
-        self.counts.resize(n, 0);
-        self.errors.clear();
-        self.errors.resize(n, 0);
-        for &x in &self.ids {
-            self.counts[x as usize >> 1] += 1;
-            self.errors[x as usize >> 1] += x as u32 & 1;
+        let (recs, start, next, end) = (&mut self.recs, &mut self.start, &mut self.next, &mut self.end);
+        for v in [&mut *start, &mut *next, &mut *end] {
+            v.clear();
+            v.resize(n, 0);
         }
-        // Counting sort: each endpoint gets a contiguous range of `lat`, ranges in name order.
+        for &r in recs.iter() {
+            end[(r >> 33) as usize] += 1;
+        }
         let mut pos = 0;
         for &i in &self.order {
-            let c = self.counts[i];
-            self.counts[i] = pos;
-            pos += c;
+            (start[i], next[i], pos) = (pos, pos, pos + end[i]);
+            end[i] = pos;
         }
-        self.lat.resize(self.lines.len(), 0);
-        for (&x, &v) in self.ids.iter().zip(&self.lines) {
-            let c = &mut self.counts[x as usize >> 1];
-            self.lat[*c as usize] = v;
-            *c += 1;
-        }
-        let prefix = hour_label(h);
-        let mut a = 0;
+        // In-place counting sort (American flag): take the record at a group's next free
+        // slot and swap it towards where it belongs until one for this group comes back.
+        // Groups end up contiguous, in name order, with no second buffer.
         for &i in &self.order {
-            let b = self.counts[i] as usize; // after the scatter this is the range's end
-            if a == b {
+            while next[i] < end[i] {
+                let mut r = recs[next[i]];
+                loop {
+                    let g = (r >> 33) as usize;
+                    if g == i {
+                        break;
+                    }
+                    std::mem::swap(&mut r, &mut recs[next[g]]);
+                    next[g] += 1;
+                }
+                recs[next[i]] = r;
+                next[i] += 1;
+            }
+        }
+        let mut bytes = 0;
+        for &i in &self.order {
+            let v = &mut recs[start[i]..end[i]];
+            let cnt = v.len();
+            if cnt == 0 {
                 continue;
             }
-            let v = &mut self.lat[a..b];
-            let cnt = v.len();
-            buf.extend_from_slice(prefix.as_bytes());
-            buf.extend_from_slice(table.key(i));
-            buf.push(b' ');
-            put_num(buf, cnt as u64, b' ');
-            // Nearest rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything
-            // from that index on in v[lo..], so the next search is smaller.
-            let mut lo = 0;
-            for p in [50, 95, 99] {
-                let k = (p * cnt + 99) / 100 - 1;
-                let x = *v[lo..].select_nth_unstable(k - lo).1;
-                put_num(buf, x as u64, b' ');
+            // Within a group the id bits are equal, so records order by latency. Nearest
+            // rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything from that
+            // index on in v[lo..], so the next search is smaller.
+            let (mut lo, mut p) = (0, [0; 3]);
+            for (q, pct) in p.iter_mut().zip([50, 95, 99]) {
+                let k = (pct * cnt + 99) / 100 - 1;
+                *q = (*v[lo..].select_nth_unstable(k - lo).1 >> 1) as u32;
                 lo = k;
             }
-            let errs = self.errors[i] as u64;
-            put_num(buf, errs, b' ');
-            put_num(buf, errs * 1_000_000 / cnt as u64, b'\n');
-            a = b;
+            let errors = v.iter().map(|&r| r as u32 & 1).sum();
+            let row = Row { name: table.key(i), n: cnt as u32, p, errors };
+            bytes += row.len();
+            rows.push(row);
         }
-        self.ids.clear();
-        self.lines.clear();
+        recs.clear();
+        bytes
     }
 }
 
-/// Hours finish out of order. Each finished hour waits here until every earlier hour has
-/// claimed its place in the file, so file offsets are handed out in output order.
+/// Hours finish out of order. A finished hour waits here as compact rows until every earlier
+/// hour has claimed its place in the file; from then on any thread may format and write it.
 struct Output {
-    next: usize,
-    offset: u64,
-    pending: Vec<Option<Vec<u8>>>,
+    next: usize,                           // first hour without a file offset
+    offset: u64,                           // where hour `next` starts
+    pending: Vec<Option<(Vec<Row>, u64)>>, // finished hours: rows and formatted size
+    ready: Vec<(usize, u64, Vec<Row>)>,    // hours with an offset, not written yet
+}
+
+struct Writer {
+    out: Mutex<Output>,
+    wake: Condvar,
+}
+
+impl Writer {
+    fn finished(&self, h: usize, rows: Vec<Row>, bytes: u64) {
+        let mut o = self.out.lock().unwrap();
+        o.pending[h] = Some((rows, bytes));
+        while o.next < HOURS {
+            let i = o.next;
+            let Some((rows, bytes)) = o.pending[i].take() else { return };
+            let item = (i, o.offset, rows);
+            o.ready.push(item);
+            o.offset += bytes;
+            o.next += 1;
+            self.wake.notify_all();
+        }
+    }
+
+    /// An hour that is ready to write. With `wait`, blocks until there is one, and returns
+    /// None only once every hour has been handed out.
+    fn take(&self, wait: bool) -> Option<(usize, u64, Vec<Row>)> {
+        let mut o = self.out.lock().unwrap();
+        loop {
+            if let Some(item) = o.ready.pop() {
+                return Some(item);
+            }
+            if !wait || o.next == HOURS {
+                return None;
+            }
+            o = self.wake.wait(o).unwrap();
+        }
+    }
 }
 
 fn main() {
@@ -350,13 +433,14 @@ fn main() {
     let masks: Vec<[AtomicU64; 2]> = (0..blocks).map(|_| Default::default()).collect();
     let has = |b: usize, h: usize| masks[b][h / 64].load(Relaxed) >> (h % 64) & 1 != 0;
     let next_hour = AtomicUsize::new(0);
-    let out = Mutex::new(Output { next: 0, offset: 0, pending: vec![None; HOURS] });
+    let out = Output { next: 0, offset: 0, pending: (0..HOURS).map(|_| None).collect(), ready: Vec::new() };
+    let writer = Writer { out: Mutex::new(out), wake: Condvar::new() };
     let barrier = Barrier::new(THREADS);
 
     // One set of threads for both passes; the barrier separates them.
     thread::scope(|s| {
         for t in 0..THREADS {
-            let (masks, has, next_hour, out, barrier, file) = (&masks, &has, &next_hour, &out, &barrier, &file);
+            let (masks, has, next_hour, writer, barrier, file) = (&masks, &has, &next_hour, &writer, &barrier, &file);
             s.spawn(move || {
                 // Pass 1: this thread's chunk. A line belongs to the block its first byte is in.
                 let (a, b) = (line_start(data, t * len / THREADS), line_start(data, (t + 1) * len / THREADS));
@@ -380,7 +464,7 @@ fn main() {
                 barrier.wait();
 
                 // Pass 2: hours handed out in increasing order, so the writer rarely has to wait.
-                let mut work = HourWork::default();
+                let (mut work, mut buf) = (HourWork::default(), Vec::new());
                 loop {
                     let h = next_hour.fetch_add(1, Relaxed);
                     if h >= HOURS {
@@ -399,24 +483,18 @@ fn main() {
                         }
                         work.collect(data, line_start(data, first << BLOCK_SHIFT), line_start(data, b << BLOCK_SHIFT), h);
                     }
-                    let mut buf = Vec::with_capacity(256 << 10);
-                    work.finish(h, &mut buf);
-                    // Under the lock only claim file offsets; the writes themselves run unlocked.
-                    let mut ready = Vec::new();
-                    {
-                        let mut o = out.lock().unwrap();
-                        o.pending[h] = Some(buf);
-                        while o.next < HOURS {
-                            let i = o.next;
-                            let Some(done) = o.pending[i].take() else { break };
-                            ready.push((o.offset, done));
-                            o.offset += ready.last().unwrap().1.len() as u64;
-                            o.next += 1;
-                        }
+                    // An hour's size is known before it is formatted, so only the file offset
+                    // is claimed in order; formatting and writing run unlocked, through a
+                    // small buffer, by whichever thread is free.
+                    let mut rows = Vec::new();
+                    let bytes = work.finish(&mut rows);
+                    writer.finished(h, rows, bytes);
+                    while let Some((h, off, rows)) = writer.take(false) {
+                        write_hour(file, off, h, &rows, &mut buf);
                     }
-                    for (off, done) in ready {
-                        file.write_all_at(&done, off).unwrap();
-                    }
+                }
+                while let Some((h, off, rows)) = writer.take(true) {
+                    write_hour(file, off, h, &rows, &mut buf);
                 }
             });
         }
