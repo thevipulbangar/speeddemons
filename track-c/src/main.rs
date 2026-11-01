@@ -305,6 +305,99 @@ fn record(d: &[u8], mut p: usize) -> Option<(Rec<'_>, usize)> {
     Some((Rec { id, rid: rid as usize, cents, name, key: key(d, name), name_len, note_len }, next))
 }
 
+/// Bytes that must follow any position the fast path reads from: one 8-byte number load plus
+/// the rest of the record's fixed tail.
+const SLACK: usize = 64;
+
+/// `number` without bounds checks, for 1 to 7 digits.
+#[inline(always)]
+unsafe fn number_fast(d: &[u8], p: usize, stop: u8) -> Option<(u64, usize)> {
+    // SAFETY: callers guarantee p + SLACK <= d.len(), so the 8-byte load stays inside d.
+    let w = unsafe { (d.as_ptr().add(p) as *const u64).read_unaligned() };
+    let x = w ^ 0x3030_3030_3030_3030;
+    let n = (((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080).trailing_zeros() / 8) as usize;
+    if n == 0 || n == 8 || (w >> (8 * n)) as u8 != stop {
+        return None;
+    }
+    let mut v = x << (64 - 8 * n);
+    v = (v & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+    v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6553601) >> 16;
+    v = (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32;
+    Some((v, p + n + 1))
+}
+
+/// `text` without bounds checks, for a quoted or empty field; None for anything else.
+#[inline(always)]
+unsafe fn text_fast(d: &[u8], p: usize) -> Option<(&[u8], u64, usize)> {
+    // SAFETY: callers guarantee p + SLACK <= d.len(); past the closing quote we check again.
+    let at = |i: usize| unsafe { *d.get_unchecked(i) };
+    if at(p) == b',' {
+        return Some((&d[p..p], 0, p + 1));
+    }
+    if at(p) != b'"' {
+        return None;
+    }
+    let (mut q, mut esc) = (p + 1, 0);
+    loop {
+        q = find_quote(d, q)?;
+        if q + SLACK > d.len() {
+            return None;
+        }
+        if at(q + 1) != b'"' {
+            break;
+        }
+        esc += 1;
+        q += 2;
+    }
+    // SAFETY: p + 1 <= q < d.len().
+    let raw = unsafe { d.get_unchecked(p + 1..q) };
+    (at(q + 1) == b',').then_some((raw, (q - p - 1 - esc) as u64, q + 2))
+}
+
+/// The common record, parsed without bounds checks: quoted or empty text, short numbers, a
+/// terminator, and SLACK bytes after every field. None hands the record to the checked
+/// `record`, which also gives the final verdict on bad input.
+#[inline(always)]
+fn fast(d: &[u8], mut p: usize) -> Option<(Rec<'_>, usize)> {
+    if p + SLACK > d.len() {
+        return None;
+    }
+    // SAFETY: every index read here is within SLACK bytes of a position checked against d.len().
+    let at = |i: usize| unsafe { *d.get_unchecked(i) };
+    if at(p) == 0xEF {
+        if at(p + 1) != 0xBB || at(p + 2) != 0xBF {
+            return None;
+        }
+        p += 3;
+    }
+    // SAFETY: p + SLACK <= d.len() was checked above (a BOM moves p by 3, inside the slack).
+    let (id, q) = unsafe { number_fast(d, p, b',') }?;
+    // SAFETY: q is at most p + 11, inside the slack checked above.
+    let (name, name_len, q) = unsafe { text_fast(d, q) }?;
+    // SAFETY: text_fast returns a position at most 2 past a quote q with q + SLACK <= d.len().
+    let (_, note_len, q) = unsafe { text_fast(d, q) }?;
+    if q + SLACK > d.len() {
+        return None;
+    }
+    // SAFETY: q + SLACK <= d.len(); the amount and terminator lie within 24 bytes after rid.
+    let (rid, q) = unsafe { number_fast(d, q, b',') }?;
+    let neg = at(q) == b'-';
+    // SAFETY: as above.
+    let (whole, q) = unsafe { number_fast(d, q + neg as usize, b'.') }?;
+    let (f0, f1) = (at(q).wrapping_sub(b'0'), at(q + 1).wrapping_sub(b'0'));
+    if f0 > 9 || f1 > 9 {
+        return None;
+    }
+    let next = match at(q + 2) {
+        b'\n' => q + 3,
+        b'\r' if at(q + 3) == b'\n' => q + 4,
+        _ => return None,
+    };
+    let cents = whole as i64 * 100 + (f0 * 10 + f1) as i64;
+    let cents = if neg { -cents } else { cents };
+    Some((Rec { id, rid: rid as usize, cents, name, key: key(d, name), name_len, note_len }, next))
+}
+
 /// Everything the workers share.
 struct Ctx<'a> {
     d: &'a [u8],
@@ -372,7 +465,7 @@ fn worker(c: &Ctx, k: usize, start: usize, end: usize, load_regions: bool) -> Pa
         // Parse a batch and prefetch the table lines it needs, then do the lookups.
         batch.clear();
         while p < end && batch.len() < BATCH {
-            let Some((r, q)) = record(d, p) else {
+            let Some((r, q)) = fast(d, p).or_else(|| record(d, p)) else {
                 ok = false;
                 break 'parse;
             };
