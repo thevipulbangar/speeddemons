@@ -12,13 +12,12 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Barrier, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::thread;
 
 const HOURS: usize = 72; // 2026-10-30T18 .. 2026-11-02T17, fixed by the spec
 const THREADS: usize = 12; // the scoring box gives us exactly 12 hardware threads
-const BLOCK_SHIFT: u32 = 14; // 16 KiB blocks, about 200 lines each
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -148,7 +147,7 @@ unsafe fn same(a: *const u8, b: *const u8, n: usize) -> bool {
 /// Open-addressing endpoint -> dense id table, private to one thread. Key bytes are copied
 /// into one small arena, so probing touches a few hot cache lines instead of ~1,800 scattered
 /// places in the 239 MB mapping. A slot packs everything a lookup needs into one word:
-/// arena offset << 32 | length << 16 | id + 1 (0 = empty).
+/// arena offset << 32 | (id + 1) << 8 | length (0 = empty; endpoints are at most 125 bytes).
 struct Table {
     slots: Vec<u64>,
     spans: Vec<(u32, u32)>, // id -> (start, end) in `arena`
@@ -188,9 +187,9 @@ impl Table {
             if s == 0 {
                 break;
             }
-            let (start, n) = ((s >> 32) as usize, (s >> 16) as u16 as usize);
+            let (start, n) = ((s >> 32) as usize, s as u8 as usize);
             if n == k.len() && unsafe { same(self.arena.as_ptr().add(start), k.as_ptr(), n) } {
-                return (s as u16 - 1) as usize;
+                return (s as u32 >> 8) as usize - 1;
             }
             i = (i + 1) & mask;
         }
@@ -206,7 +205,7 @@ impl Table {
     }
 
     fn slot(start: usize, len: usize, id1: usize) -> u64 {
-        (start as u64) << 32 | (len as u64) << 16 | id1 as u64
+        (start as u64) << 32 | (id1 as u64) << 8 | len as u64
     }
 
     fn grow(&mut self) {
@@ -221,6 +220,13 @@ impl Table {
             self.slots[i] = Self::slot(a as usize, (b - a) as usize, id + 1);
         }
     }
+}
+/// One thread's lines of one hour. `ids` holds endpoint id << 1 | is_5xx; the spec fixes the
+/// catalogue at 1,842 endpoints; 31 bits leave room for any input.
+#[derive(Default)]
+struct Bucket {
+    ids: Vec<u32>,
+    lat: Vec<u32>,
 }
 
 fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
@@ -238,95 +244,65 @@ fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
     buf.extend_from_slice(&tmp[i..]);
 }
 
-/// Per-thread state for pass 2, reused from one hour to the next.
-#[derive(Default)]
-struct HourWork {
-    table: Option<Table>,
-    order: Vec<usize>,  // endpoint ids sorted by name, i.e. output order
-    ids: Vec<u16>,      // this hour's lines: endpoint id ...
-    lines: Vec<u32>,    // ... and latency
-    counts: Vec<u32>,   // per id: lines this hour, then end cursor of its latency range
-    errors: Vec<u32>,   // per id: 5xx lines this hour
-    lat: Vec<u32>,      // this hour's latencies, grouped by endpoint in output order
-}
-
-impl HourWork {
-    /// Parses every line of hour `h` in `data[start..end]`.
-    fn collect(&mut self, data: &[u8], start: usize, end: usize, h: usize) {
-        let want = hour_key(hour_label(h).as_bytes());
-        let table = self.table.get_or_insert_with(Table::new);
-        for_each_line(data, start, end, |_, l| {
-            if hour_key(l) == want {
-                let (ep, is_err, latency) = parse_rest(l);
-                let id = table.id(ep);
-                self.ids.push((id << 1 | is_err as usize) as u16);
-                self.lines.push(latency);
-            }
-        });
+/// Formats hour `h` from its buckets (one per parse thread); `rank[t]` maps thread t's local
+/// endpoint ids to positions in `names`. `count` and `lat` are scratch space reused per hour.
+fn format_hour(h: usize, mut buckets: Vec<Bucket>, rank: &[Vec<u32>], names: &[&[u8]], count: &mut Vec<u32>, lat: &mut Vec<u32>) -> Vec<u8> {
+    let e = names.len();
+    count.clear();
+    count.resize(2 * e, 0); // [lines per rank | errors per rank]
+    let mut total = 0;
+    for (b, rank) in buckets.iter_mut().zip(rank) {
+        for x in b.ids.iter_mut() {
+            let r = rank[*x as usize >> 1] as usize;
+            count[r] += 1;
+            count[e + r] += *x as u32 & 1;
+            *x = r as u32; // remap to the global rank once, for the scatter below
+        }
+        total += b.ids.len();
     }
-
-    /// Groups the collected lines by endpoint and appends the hour's output to `buf`.
-    fn finish(&mut self, h: usize, buf: &mut Vec<u8>) {
-        // A thread that has not parsed a line yet has no table and nothing to write.
-        let Some(table) = self.table.as_ref() else { return };
-        let n = table.spans.len();
-        // Ids are handed out in first-seen order; keep `order` sorted as new names show up.
-        // The old part is already sorted, so this is a cheap merge after the first hour.
-        if self.order.len() < n {
-            self.order.extend(self.order.len()..n);
-            self.order.sort_by(|&a, &b| table.key(a).cmp(table.key(b)));
-        }
-        self.counts.clear();
-        self.counts.resize(n, 0);
-        self.errors.clear();
-        self.errors.resize(n, 0);
-        for &x in &self.ids {
-            self.counts[x as usize >> 1] += 1;
-            self.errors[x as usize >> 1] += x as u32 & 1;
-        }
-        // Counting sort: each endpoint gets a contiguous range of `lat`, ranges in name order.
-        let mut pos = 0;
-        for &i in &self.order {
-            let c = self.counts[i];
-            self.counts[i] = pos;
-            pos += c;
-        }
-        self.lat.resize(self.lines.len(), 0);
-        for (&x, &v) in self.ids.iter().zip(&self.lines) {
-            let c = &mut self.counts[x as usize >> 1];
-            self.lat[*c as usize] = v;
-            *c += 1;
-        }
-        let prefix = hour_label(h);
-        let mut a = 0;
-        for &i in &self.order {
-            let b = self.counts[i] as usize; // after the scatter this is the range's end
-            if a == b {
-                continue;
-            }
-            let v = &mut self.lat[a..b];
-            let cnt = v.len();
-            buf.extend_from_slice(prefix.as_bytes());
-            buf.extend_from_slice(table.key(i));
-            buf.push(b' ');
-            put_num(buf, cnt as u64, b' ');
-            // Nearest rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything
-            // from that index on in v[lo..], so the next search is smaller.
-            let mut lo = 0;
-            for p in [50, 95, 99] {
-                let k = (p * cnt + 99) / 100 - 1;
-                let x = *v[lo..].select_nth_unstable(k - lo).1;
-                put_num(buf, x as u64, b' ');
-                lo = k;
-            }
-            let errs = self.errors[i] as u64;
-            put_num(buf, errs, b' ');
-            put_num(buf, errs * 1_000_000 / cnt as u64, b'\n');
-            a = b;
-        }
-        self.ids.clear();
-        self.lines.clear();
+    // Counting sort: each endpoint gets a contiguous range of `lat`, ranges in name order.
+    let mut pos = 0;
+    for c in &mut count[..e] {
+        (*c, pos) = (pos, pos + *c);
     }
+    lat.resize(total, 0);
+    for b in buckets {
+        for (&r, &v) in b.ids.iter().zip(&b.lat) {
+            lat[count[r as usize] as usize] = v;
+            count[r as usize] += 1;
+        }
+    } // the records of this hour are freed here
+    let abs = 18 + h; // hours since 2026-10-30T00
+    let days = ["2026-10-30T", "2026-10-31T", "2026-11-01T", "2026-11-02T"];
+    let prefix = format!("{}{:02}:00:00Z ", days[abs / 24], abs % 24);
+    let mut buf = Vec::with_capacity(total * 40);
+    let mut a = 0;
+    for r in 0..e {
+        let b = count[r] as usize; // after the scatter this is the end of rank r's range
+        if a == b {
+            continue;
+        }
+        let v = &mut lat[a..b];
+        let n = v.len();
+        buf.extend_from_slice(prefix.as_bytes());
+        buf.extend_from_slice(names[r]);
+        buf.push(b' ');
+        put_num(&mut buf, n as u64, b' ');
+        // Nearest rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything from
+        // that index on in v[lo..], so the next search is smaller.
+        let mut lo = 0;
+        for p in [50, 95, 99] {
+            let k = (p * n + 99) / 100 - 1;
+            let x = *v[lo..].select_nth_unstable(k - lo).1;
+            put_num(&mut buf, x as u64, b' ');
+            lo = k;
+        }
+        let errs = count[e + r] as u64;
+        put_num(&mut buf, errs, b' ');
+        put_num(&mut buf, errs * 1_000_000 / n as u64, b'\n');
+        a = b;
+    }
+    buf
 }
 
 /// Hours finish out of order. Each finished hour waits here until every earlier hour has
@@ -345,62 +321,66 @@ fn main() {
     let len = data.len();
     let file = File::create(format!("{out_dir}/summary.txt")).expect("cannot create summary.txt");
 
-    // Hours present in each block, as two 64-bit halves of a 72-bit mask.
-    let blocks = (len >> BLOCK_SHIFT) + 1;
-    let masks: Vec<[AtomicU64; 2]> = (0..blocks).map(|_| Default::default()).collect();
-    let has = |b: usize, h: usize| masks[b][h / 64].load(Relaxed) >> (h % 64) & 1 != 0;
+    // Parse: per thread, an endpoint table and one bucket per hour.
+    let parsed: Vec<(Table, Vec<Bucket>)> = thread::scope(|s| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                s.spawn(move || {
+                    let (a, b) = (line_start(data, t * len / THREADS), line_start(data, (t + 1) * len / THREADS));
+                    let mut table = Table::new();
+                    let mut hours: Vec<Bucket> = (0..HOURS).map(|_| Bucket::default()).collect();
+                    for_each_line(data, a, b, |_, l| {
+                        let (h, (ep, is_err, latency)) = (hour_of(l), parse_rest(l));
+                        let id = table.id(ep);
+                        let bucket = &mut hours[h];
+                        bucket.ids.push((id << 1 | is_err as usize) as u32);
+                        bucket.lat.push(latency);
+                    });
+                    (table, hours)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Names: dedupe all threads' endpoints through one table, sort the distinct ones, and map
+    // every thread's local ids to the sorted position.
+    let mut all = Table::new();
+    for (table, _) in &parsed {
+        for k in (0..table.spans.len()).map(|i| table.key(i)) {
+            all.id(k);
+        }
+    }
+    let mut order: Vec<usize> = (0..all.spans.len()).collect();
+    order.sort_unstable_by_key(|&i| all.key(i));
+    let mut global_rank = vec![0u32; order.len()];
+    for (r, &i) in order.iter().enumerate() {
+        global_rank[i] = r as u32;
+    }
+    let mut rank = Vec::new();
+    let mut by_hour: Vec<Mutex<Vec<Bucket>>> = (0..HOURS).map(|_| Mutex::default()).collect();
+    for (table, hours) in parsed {
+        rank.push((0..table.spans.len()).map(|i| global_rank[all.id(table.key(i))]).collect::<Vec<u32>>());
+        for (h, b) in hours.into_iter().enumerate() {
+            by_hour[h].get_mut().unwrap().push(b);
+        }
+    }
+    let names: Vec<&[u8]> = order.iter().map(|&i| all.key(i)).collect();
+
+    // Finish: hours handed out in increasing order, so the writer rarely has to wait.
     let next_hour = AtomicUsize::new(0);
     let out = Mutex::new(Output { next: 0, offset: 0, pending: vec![None; HOURS] });
-    let barrier = Barrier::new(THREADS);
-
-    // One set of threads for both passes; the barrier separates them.
     thread::scope(|s| {
-        for t in 0..THREADS {
-            let (masks, has, next_hour, out, barrier, file) = (&masks, &has, &next_hour, &out, &barrier, &file);
-            s.spawn(move || {
-                // Pass 1: this thread's chunk. A line belongs to the block its first byte is in.
-                let (a, b) = (line_start(data, t * len / THREADS), line_start(data, (t + 1) * len / THREADS));
-                let (mut cur, mut m) = (a >> BLOCK_SHIFT, 0u128);
-                let (mut key, mut bit) = (0, 0); // hour of the previous line, usually the same
-                let flush = |b: usize, m: u128| {
-                    masks[b][0].fetch_or(m as u64, Relaxed);
-                    masks[b][1].fetch_or((m >> 64) as u64, Relaxed);
-                };
-                for_each_line(data, a, b, |off, l| {
-                    if off >> BLOCK_SHIFT != cur {
-                        flush(cur, m);
-                        (cur, m) = (off >> BLOCK_SHIFT, 0);
-                    }
-                    if hour_key(l) != key {
-                        (key, bit) = (hour_key(l), 1 << hour_of(l));
-                    }
-                    m |= bit;
-                });
-                flush(cur, m);
-                barrier.wait();
-
-                // Pass 2: hours handed out in increasing order, so the writer rarely has to wait.
-                let mut work = HourWork::default();
+        for _ in 0..THREADS {
+            s.spawn(|| {
+                let (mut count, mut lat) = (Vec::new(), Vec::new());
                 loop {
                     let h = next_hour.fetch_add(1, Relaxed);
                     if h >= HOURS {
                         break;
                     }
-                    // Parse each run of consecutive blocks that contain hour h.
-                    let mut b = 0;
-                    while b < blocks {
-                        if !has(b, h) {
-                            b += 1;
-                            continue;
-                        }
-                        let first = b;
-                        while b < blocks && has(b, h) {
-                            b += 1;
-                        }
-                        work.collect(data, line_start(data, first << BLOCK_SHIFT), line_start(data, b << BLOCK_SHIFT), h);
-                    }
-                    let mut buf = Vec::with_capacity(256 << 10);
-                    work.finish(h, &mut buf);
+                    let buckets = std::mem::take(&mut *by_hour[h].lock().unwrap());
+                    let buf = format_hour(h, buckets, &rank, &names, &mut count, &mut lat);
                     // Under the lock only claim file offsets; the writes themselves run unlocked.
                     let mut ready = Vec::new();
                     {
