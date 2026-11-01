@@ -1,13 +1,10 @@
 //! Track B: answer 50,000 BOOL / PHRASE queries over a 254 MB corpus.
 //!
 //! The queries are read first, so only the terms they use are ever looked up.
-//! The mmapped corpus is split into one line-aligned chunk per thread and read twice:
-//!   1. tokenize (AVX2), look each token up in the query lexicon, count the document
-//!      frequency of every BOOL term, and run an Aho-Corasick automaton over term ids so
-//!      every PHRASE is matched in this pass; no positions are ever stored;
-//!   2. tokenize again and write each BOOL term's documents straight into their final
-//!      place: a bitmap for terms in more than 1/32 of the documents, else a sorted u32
-//!      list in one shared array (sizes and offsets come from pass 1's counts).
+//! The mmapped corpus is split into chunks of whole 64-document groups, one per thread, and
+//! read once: tokenize (AVX2), look each token up in the query lexicon, set the bitmap bit of
+//! frequent BOOL terms, stream the hits of the other BOOL terms into a per-chunk CSR index of
+//! u16 doc ids, and check phrases where their rarest term occurs. No positions are stored.
 //! BOOL queries are evaluated left to right on sorted lists, switching to a bitmap
 //! only when an operand is a bitmap term.
 
@@ -20,8 +17,8 @@ use std::thread;
 
 const NONE: u32 = u32::MAX;
 const DENSE: u32 = 1 << 31;
-const SPARSE: u32 = NONE - 1;
-const CONT: u32 = 1 << 31;
+const SPARSE: u32 = 1 << 30;
+const TRIG: u32 = 1 << 29;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -46,6 +43,7 @@ type Key = [u64; 4];
 fn key_of(term: &[u8]) -> Key {
     let mut b = [0u8; 32];
     b[..term.len()].copy_from_slice(term);
+    b.make_ascii_lowercase();
     std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
 }
 
@@ -58,58 +56,18 @@ fn hash(k: &Key) -> u64 {
     h ^ (h >> 29)
 }
 
-/// A token of up to 8 bytes is its own map key (its top bit is clear, bytes are ASCII);
-/// longer ones use their hash with the top bit set and are checked against the stored key.
-#[inline(always)]
-fn tag(k: &Key) -> u64 {
-    if k[1] == 0 {
-        k[0]
-    } else {
-        hash(k) | 1 << 63
-    }
-}
-
-/// Open addressing from a 64-bit hash to a u32; `eq` settles equal hashes.
-struct Map {
-    slots: Vec<(u64, u32)>,
-    mask: usize,
-}
-
-impl Map {
-    fn new(n: usize) -> Map {
-        let cap = (n * 2 + 16).next_power_of_two();
-        Map { slots: vec![(0, NONE); cap], mask: cap - 1 }
-    }
-    #[inline(always)]
-    fn find(&self, h: u64, eq: impl Fn(u32) -> bool) -> u32 {
-        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & self.mask;
-        loop {
-            let (k, v) = self.slots[i];
-            if v == NONE || (k == h && eq(v)) {
-                return v;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-    fn insert(&mut self, h: u64, v: u32) {
-        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & self.mask;
-        while self.slots[i].1 != NONE {
-            i = (i + 1) & self.mask;
-        }
-        self.slots[i] = (h, v);
-    }
-}
-
-/// One lexicon slot: the term's tag, id and kind (NONE: phrases only, SPARSE: doc list,
-/// DENSE | i: bitmap i), so a corpus token costs one cache line to look up.
+/// One lexicon slot: the term's first 16 bytes, id and kind (0: phrases only, SPARSE: doc
+/// list, DENSE | i: bitmap i, plus TRIG if it triggers phrase checks). Tokens of up to 16
+/// bytes, nearly all of them, are compared and classified within this one cache line.
 #[derive(Clone, Copy)]
 struct Slot {
-    tag: u64,
+    w: [u64; 2],
     id: u32,
     kind: u32,
+    trig: [u32; 2], // its entries in `trig`, if it triggers phrase checks
 }
 
-const EMPTY: Slot = Slot { tag: 0, id: NONE, kind: NONE };
+const EMPTY: Slot = Slot { w: [0; 2], id: NONE, kind: 0, trig: [0; 2] };
 
 /// Query terms, each with a dense id.
 struct Lexicon {
@@ -118,31 +76,39 @@ struct Lexicon {
 }
 
 impl Lexicon {
-    fn new() -> Lexicon {
-        Lexicon { slots: vec![EMPTY; 1024], keys: Vec::new() }
+    fn new(n: usize) -> Lexicon {
+        Lexicon { slots: vec![EMPTY; n.next_power_of_two().max(1024)], keys: Vec::new() }
     }
     /// The slot of term k, EMPTY when k is not a query term.
     #[inline(always)]
     fn find(&self, k: &Key) -> Slot {
-        let tag = tag(k);
-        let mask = self.slots.len() - 1;
-        let mut i = (tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+        self.probe(&self.slots, k, hash(k))
+    }
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        let i = (h >> 32) as usize & (self.slots.len() - 1);
+        // SAFETY: a prefetch of an address inside `slots`.
+        unsafe { _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0) };
+    }
+    #[inline(always)]
+    fn probe(&self, slots: &[Slot], k: &Key, h: u64) -> Slot {
+        let mask = slots.len() - 1;
+        let mut i = (h >> 32) as usize & mask;
         loop {
-            let s = self.slots[i];
-            if s.id == NONE || (s.tag == tag && (tag >> 63 == 0 || self.keys[s.id as usize] == *k)) {
+            let s = slots[i];
+            if s.id == NONE || (s.w == [k[0], k[1]] && (k[2] == 0 || self.keys[s.id as usize] == *k)) {
                 return s;
             }
             i = (i + 1) & mask;
         }
     }
-    fn insert(&mut self, id: u32) {
-        let tag = tag(&self.keys[id as usize]);
-        let mask = self.slots.len() - 1;
-        let mut i = (tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
-        while self.slots[i].id != NONE {
+    fn insert(slots: &mut [Slot], k: &Key, id: u32) {
+        let mask = slots.len() - 1;
+        let mut i = (hash(k) >> 32) as usize & mask;
+        while slots[i].id != NONE {
             i = (i + 1) & mask;
         }
-        self.slots[i] = Slot { tag, id, kind: NONE };
+        slots[i] = Slot { w: [k[0], k[1]], id, kind: 0, trig: [0; 2] };
     }
     fn id(&mut self, term: &[u8]) -> u32 {
         let k = key_of(term);
@@ -157,93 +123,13 @@ impl Lexicon {
         self.keys.push(k);
         if self.keys.len() * 10 >= self.slots.len() * 6 {
             self.slots = vec![EMPTY; self.slots.len() * 2];
-            (0..self.keys.len() as u32).for_each(|i| self.insert(i));
+            for (i, k) in self.keys.iter().enumerate() {
+                Lexicon::insert(&mut self.slots, k, i as u32);
+            }
         } else {
-            self.insert(id);
+            Lexicon::insert(&mut self.slots, &k, id);
         }
         id
-    }
-}
-
-/// Aho-Corasick over term ids. State 0 is the root; a phrase is identified by its final state.
-struct Automaton {
-    root: Vec<u32>, // root transitions by term id, 0 = none; CONT if the term is ever 2nd+ in a phrase
-    goto: Map,      // (state, term) -> state for every other state
-    fail: Vec<u32>,
-    out: Vec<u32>, // nearest proper suffix state that ends a phrase, 0 = none
-    end: Vec<bool>,
-}
-
-impl Automaton {
-    #[inline(always)]
-    fn edge(&self, s: u32, t: u32) -> u32 {
-        if s == 0 {
-            return self.root[t as usize] & !CONT;
-        }
-        self.goto.find((s as u64) << 32 | t as u64, |_| true)
-    }
-    #[inline(always)]
-    fn step(&self, mut s: u32, t: u32) -> u32 {
-        let r = self.root[t as usize];
-        if r & CONT == 0 {
-            return r; // only the root has an edge on t
-        }
-        loop {
-            let n = self.edge(s, t);
-            if s == 0 || n != NONE {
-                return n;
-            }
-            s = self.fail[s as usize];
-        }
-    }
-    fn build(nterms: usize, phrases: &[Vec<u32>]) -> (Automaton, Vec<u32>) {
-        let mut a = Automaton {
-            root: vec![0; nterms],
-            goto: Map::new(phrases.iter().map(|p| p.len()).sum()),
-            fail: vec![0],
-            out: vec![0],
-            end: vec![false],
-        };
-        let mut parent = vec![(0u32, 0u32)];
-        let mut ends = Vec::with_capacity(phrases.len());
-        for p in phrases {
-            let mut s = 0;
-            for &t in p {
-                let n = a.edge(s, t);
-                s = if n != NONE && n != 0 {
-                    n
-                } else {
-                    let n = a.fail.len() as u32;
-                    if s == 0 {
-                        a.root[t as usize] = n;
-                    } else {
-                        a.goto.insert((s as u64) << 32 | t as u64, n);
-                    }
-                    a.fail.push(0);
-                    a.out.push(0);
-                    a.end.push(false);
-                    parent.push((s, t));
-                    n
-                };
-            }
-            a.end[s as usize] = true;
-            ends.push(s);
-        }
-        phrases.iter().flat_map(|p| &p[1..]).for_each(|&t| a.root[t as usize] |= CONT);
-        // Fail links in breadth-first order: a state is deeper than its parent.
-        let mut depth = vec![0u32; parent.len()];
-        for s in 1..parent.len() {
-            depth[s] = depth[parent[s].0 as usize] + 1;
-        }
-        let mut order: Vec<u32> = (1..parent.len() as u32).collect();
-        order.sort_by_key(|&s| depth[s as usize]);
-        for s in order {
-            let (p, t) = parent[s as usize];
-            let f = if p == 0 { 0 } else { a.step(a.fail[p as usize], t) };
-            a.fail[s as usize] = f;
-            a.out[s as usize] = if a.end[f as usize] { f } else { a.out[f as usize] };
-        }
-        (a, ends)
     }
 }
 
@@ -285,7 +171,7 @@ fn masks(data: &[u8], p: usize) -> (u64, u64) {
 /// Works on 64-byte blocks: token starts, token lengths and line ends all come out of
 /// the blocks' bit masks, so the inner loop runs once per token with no per-byte work.
 #[inline(always)]
-fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMut(u32, Slot)) {
+fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMut(u32, Slot, usize)) {
     const PREFIX: [u8; 64] = {
         let mut m = [0u8; 64];
         let mut i = 0;
@@ -296,6 +182,11 @@ fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMu
         m
     };
     let (mut doc, mut want_id, mut carry) = (0u32, true, 0u64);
+    // Lookups lag one block behind: a block's slots are prefetched, then the previous block's
+    // tokens are looked up, so the cache misses of up to two blocks overlap.
+    let mut batch = [(0u32, 0usize, [0u64; 4], 0u64); 32];
+    let mut ready = [(0u32, 0usize, [0u64; 4], 0u64); 32];
+    let mut nready = 0;
     let (mut tok, mut nl) = masks(data, start);
     let mut b = start;
     while b < end {
@@ -305,6 +196,7 @@ fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMu
         if end - b < 64 {
             ev &= (1u64 << (end - b)) - 1;
         }
+        let mut n = 0;
         while ev != 0 {
             let i = ev.trailing_zeros();
             ev &= ev - 1;
@@ -318,20 +210,30 @@ fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMu
                 // The first token of a line is the document id.
                 doc = data[p..p + len].iter().fold(0, |a, &c| a * 10 + (c - b'0') as u32);
                 want_id = false;
-            } else if len > 32 {
-                f(doc, EMPTY); // longer than any query term
             } else {
-                let mut k: Key = [0; 4];
+                let mut k: Key = [0; 4]; // stays zero, so matches nothing, for a token longer than any term
                 // SAFETY: PREFIX[32 - len..] has 32 readable bytes; k is 32 bytes.
-                unsafe {
+                if len <= 32 {
+                    unsafe {
                     let m = _mm256_loadu_si256(PREFIX[32 - len..].as_ptr() as *const __m256i);
                     let v = _mm256_or_si256(load32(data, p), _mm256_set1_epi8(0x20));
                     _mm256_storeu_si256(k.as_mut_ptr() as *mut __m256i, _mm256_and_si256(v, m));
+                    }
                 }
-                f(doc, lex.find(&k));
+                let h = hash(&k);
+                lex.prefetch(h);
+                batch[n] = (doc, p + len, k, h);
+                n += 1;
             }
         }
+        for (d, e, k, h) in &ready[..nready] {
+            f(*d, lex.probe(&lex.slots, k, *h), *e);
+        }
+        (ready, batch, nready) = (batch, ready, n);
         (tok, nl, b) = (next_tok, next_nl, b + 64);
+    }
+    for (d, e, k, h) in &ready[..nready] {
+        f(*d, lex.probe(&lex.slots, k, *h), *e);
     }
 }
 
@@ -339,7 +241,7 @@ fn tokens(data: &[u8], start: usize, end: usize, lex: &Lexicon, mut f: impl FnMu
 struct Shared(*mut u64);
 unsafe impl Sync for Shared {}
 
-/// A query after parsing: BOOL as (op, term) pairs, PHRASE as its index in the automaton.
+/// A query after parsing: BOOL as (op, term) pairs, PHRASE as its distinct-phrase index.
 enum Query {
     Bool(Vec<(u8, u32)>),
     Phrase(u32),
@@ -435,9 +337,10 @@ fn main() {
     }
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
 
-    // Parse queries. Every term gets a lexicon id; phrases go into the automaton.
-    let mut lex = Lexicon::new();
-    let mut phrases: Vec<Vec<u32>> = Vec::new();
+    // Parse queries. Every term gets a lexicon id; identical phrases share one entry.
+    let mut lex = Lexicon::new(qtext.len() / 16);
+    let mut phrases: Vec<Vec<u32>> = Vec::new(); // distinct phrases
+    let mut phrase_ids = std::collections::HashMap::new();
     let mut queries = Vec::new();
     for line in qtext.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         if let Some(rest) = line.strip_prefix(b"BOOL ") {
@@ -453,8 +356,12 @@ fn main() {
             queries.push(Query::Bool(q));
         } else {
             let rest = &line[8..line.len() - 1]; // PHRASE "...."
-            phrases.push(rest.split(|&b| b == b' ').map(|w| lex.id(w)).collect());
-            queries.push(Query::Phrase(phrases.len() as u32 - 1));
+            let p: Vec<u32> = rest.split(|&b| b == b' ').map(|w| lex.id(w)).collect();
+            let n = phrase_ids.len() as u32;
+            queries.push(Query::Phrase(*phrase_ids.entry(p.clone()).or_insert_with(|| {
+                phrases.push(p);
+                n
+            })));
         }
     }
     // Sample the first megabyte of the corpus. Its document frequencies decide which BOOL
@@ -462,7 +369,7 @@ fn main() {
     // that make up most tokens share the same cache lines in every per-term array.
     let mut sdf = vec![(NONE, 0u32); lex.keys.len()];
     let mut sdocs = 0;
-    tokens(docs, 0, line_start(docs, docs.len().min(1 << 20)), &lex, |d, s| {
+    tokens(docs, 0, line_start(docs, docs.len().min(1 << 20)), &lex, |d, s, _| {
         sdocs = d + 1;
         let t = s.id;
         if t != NONE && sdf[t as usize].0 != d {
@@ -471,21 +378,20 @@ fn main() {
     });
     let mut order: Vec<u32> = (0..lex.keys.len() as u32).collect();
     order.sort_by_key(|&t| std::cmp::Reverse(sdf[t as usize].1));
-    let keys = std::mem::take(&mut lex.keys);
-    lex = Lexicon::new();
-    order.iter().for_each(|&t| _ = lex.push(keys[t as usize]));
     let mut rank = vec![0u32; order.len()];
     order.iter().enumerate().for_each(|(i, &t)| rank[t as usize] = i as u32);
+    lex.keys = order.iter().map(|&t| lex.keys[t as usize]).collect();
+    lex.slots.iter_mut().filter(|s| s.id != NONE).for_each(|s| s.id = rank[s.id as usize]);
     phrases.iter_mut().flatten().for_each(|t| *t = rank[*t as usize]);
     let nterms = lex.keys.len();
     // Per term: NONE (phrases only), SPARSE (sorted doc list) or DENSE | bitmap index.
-    let mut kind = vec![NONE; nterms];
+    let mut kind = vec![0; nterms];
     let mut ndense = 0;
     for q in queries.iter_mut() {
         if let Query::Bool(q) = q {
             for (_, t) in q.iter_mut() {
                 *t = rank[*t as usize];
-                if kind[*t as usize] == NONE {
+                if kind[*t as usize] == 0 {
                     // A u16 list costs 2 bytes a match, a bitmap 1/8 byte a corpus document.
                     kind[*t as usize] = if sdf[order[*t as usize] as usize].1 * 16 > sdocs {
                         ndense += 1;
@@ -497,10 +403,29 @@ fn main() {
             }
         }
     }
-    for s in lex.slots.iter_mut().filter(|s| s.id != NONE) {
-        s.kind = kind[s.id as usize];
+    // Each distinct phrase is checked only where its trigger occurs: its rarest term in the
+    // sample (the last one on a tie, so fewer terms have to be read ahead). The terms before
+    // the trigger come from a ring of the document's last 8 term ids, the ones after it are
+    // matched as the next tokens arrive. A trigger entry carries the whole phrase, so a check
+    // touches one cache line.
+    let mut trig: Vec<Trig> = Vec::with_capacity(phrases.len());
+    for (i, p) in phrases.iter().enumerate() {
+        let j = (0..p.len()).rev().min_by_key(|&j| sdf[order[p[j] as usize] as usize].1).unwrap();
+        let mut terms = [NONE; 8];
+        terms[..p.len()].copy_from_slice(p);
+        trig.push(Trig { term: p[j], phrase: i as u32, at: j as u32, len: p.len() as u32, terms });
     }
-    let (ac, ends) = Automaton::build(nterms, &phrases);
+    trig.sort_unstable_by_key(|g| (g.term, g.phrase));
+    let mut trig_start = vec![0u32; nterms + 1];
+    trig.iter().for_each(|g| trig_start[g.term as usize + 1] += 1);
+    for t in 0..nterms {
+        trig_start[t + 1] += trig_start[t];
+    }
+    for s in lex.slots.iter_mut().filter(|s| s.id != NONE) {
+        let t = s.id as usize;
+        s.kind = kind[t] | if trig_start[t] < trig_start[t + 1] { TRIG } else { 0 };
+        s.trig = [trig_start[t], trig_start[t + 1]];
+    }
 
     // Document count from the last line's id.
     let last_line = docs[..docs.len().saturating_sub(1)].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
@@ -515,50 +440,72 @@ fn main() {
     // The one pass over the corpus. Each chunk sets its bitmap bits in place, writes its
     // sparse postings as a stream of (doc marker, term ids...) that then becomes the chunk's
     // own CSR index, and collects its phrase matches.
-    let (lex, ac, kind, bm) = (&lex, &ac, &kind, &Shared(bitmaps.as_mut_ptr()));
+    let (lex, kind, bm) = (&lex, &kind, &Shared(bitmaps.as_mut_ptr()));
+    let (trig, nphrases) = (&trig, phrases.len());
     let chunks: Vec<Chunk> = thread::scope(|s| {
         let hs: Vec<_> = (0..nchunks)
             .map(|i| {
                 let (a, b) = (bounds[i], bounds[i + 1]);
                 s.spawn(move || {
                     let base = if a < b { doc_id(docs, a) } else { 0 };
-                    let mut seen = vec![NONE; nterms];
+                    let mut seen = vec![u16::MAX; nterms]; // last doc (minus base) of each term
                     let mut stream: Vec<u32> = Vec::with_capacity((b - a) / 16);
-                    let mut last_end = vec![NONE; ac.fail.len()];
+                    let mut last_match = vec![NONE; nphrases];
                     let mut hits = Vec::new();
-                    let (mut prev, mut state, mut marked) = (NONE, 0u32, false);
-                    tokens(docs, a, b, lex, |d, s| {
+                    let (mut prev, mut pos, mut marked) = (NONE, 0usize, false);
+                    let mut ring = [NONE; 8];
+                    let mut pending: Vec<(&Trig, usize)> = Vec::new(); // (phrase, index of its next term)
+                    tokens(docs, a, b, lex, |d, s, _| {
                         let t = s.id;
                         if d != prev {
-                            (prev, state, marked) = (d, 0, false);
+                            (prev, pos, marked) = (d, 0, false);
+                            pending.clear();
                         }
+                        ring[pos % 8] = t;
+                        pos += 1;
+                        // Phrases whose trigger came earlier in this document wait for their next term.
+                        pending.retain_mut(|(g, m)| {
+                            if g.terms[*m] != t {
+                                return false;
+                            }
+                            *m += 1;
+                            if *m == g.len as usize && last_match[g.phrase as usize] != d {
+                                last_match[g.phrase as usize] = d;
+                                hits.push((g.phrase, d));
+                            }
+                            *m < g.len as usize
+                        });
                         if t == NONE {
-                            state = 0;
                             return;
                         }
-                        let (ti, k) = (t as usize, s.kind);
-                        if k != NONE && seen[ti] != d {
-                            seen[ti] = d;
-                            if k == SPARSE {
-                                if !marked {
-                                    stream.push(DENSE | (d - base));
-                                    marked = true;
-                                }
-                                stream.push(t);
-                            } else {
-                                // SAFETY: the word lies in this chunk's documents, which no other
-                                // thread writes, and inside `bitmaps`.
-                                unsafe { *bm.0.add((k & !DENSE) as usize * words + d as usize / 64) |= 1 << (d % 64) };
+                        let (ti, k) = (t as usize, s.kind & !TRIG);
+                        if k & DENSE != 0 {
+                            // Setting a bit twice is harmless, so bitmap terms skip the `seen` check.
+                            // SAFETY: the word lies in this chunk's documents, which no other
+                            // thread writes, and inside `bitmaps`.
+                            unsafe { *bm.0.add((k & !DENSE) as usize * words + d as usize / 64) |= 1 << (d % 64) };
+                        } else if k == SPARSE && seen[ti] != (d - base) as u16 {
+                            seen[ti] = (d - base) as u16;
+                            if !marked {
+                                stream.push(DENSE | (d - base));
+                                marked = true;
                             }
+                            stream.push(t);
                         }
-                        state = ac.step(state, t);
-                        let mut e = if ac.end[state as usize] { state } else { ac.out[state as usize] };
-                        while e != 0 {
-                            if last_end[e as usize] != d {
-                                last_end[e as usize] = d;
-                                hits.push((e, d));
+                        if s.kind & TRIG == 0 {
+                            return;
+                        }
+                        for g in &trig[s.trig[0] as usize..s.trig[1] as usize] {
+                            let j = g.at as usize;
+                            if pos <= j || (0..j).any(|m| ring[(pos - 1 - j + m) % 8] != g.terms[m]) {
+                                continue;
                             }
-                            e = ac.out[e as usize];
+                            if j + 1 < g.len as usize {
+                                pending.push((g, j + 1));
+                            } else if last_match[g.phrase as usize] != d {
+                                last_match[g.phrase as usize] = d;
+                                hits.push((g.phrase, d));
+                            }
                         }
                     });
                     assert!(prev == NONE || prev - base < 1 << 16, "chunk too large for u16 doc ids");
@@ -569,14 +516,14 @@ fn main() {
                         off[t + 1] += off[t];
                     }
                     let mut post = vec![0u16; off[nterms] as usize];
-                    seen.copy_from_slice(&off[..nterms]);
+                    let mut cur = off[..nterms].to_vec();
                     let mut doc = 0;
                     for x in stream {
                         if x & DENSE != 0 {
                             doc = x as u16;
                         } else {
-                            post[seen[x as usize] as usize] = doc;
-                            seen[x as usize] += 1;
+                            post[cur[x as usize] as usize] = doc;
+                            cur[x as usize] += 1;
                         }
                     }
                     Chunk { base, off, post, hits }
@@ -585,13 +532,13 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut matches: Vec<Vec<u32>> = vec![Vec::new(); ac.fail.len()];
+    let mut matches: Vec<Vec<u32>> = vec![Vec::new(); phrases.len()];
     chunks.iter().flat_map(|c| &c.hits).for_each(|&(e, d)| matches[e as usize].push(d));
 
     // Answer queries in blocks; any thread takes the next block.
     const BLOCK: usize = 64;
     let next = AtomicUsize::new(0);
-    let (queries, chunks, bitmaps, matches, ends, next) = (&queries, &chunks, &bitmaps, &matches, &ends, &next);
+    let (queries, chunks, bitmaps, matches, next) = (&queries, &chunks, &bitmaps, &matches, &next);
     // All documents of a SPARSE term, ascending.
     let list = |t: usize, out: &mut Vec<u32>| {
         out.clear();
@@ -615,7 +562,7 @@ fn main() {
                         for q in &queries[b * BLOCK..((b + 1) * BLOCK).min(queries.len())] {
                             let terms = match q {
                                 Query::Phrase(p) => {
-                                    format_list(&mut out, &matches[ends[*p as usize] as usize]);
+                                    format_list(&mut out, &matches[*p as usize]);
                                     continue;
                                 }
                                 Query::Bool(terms) => terms,
@@ -683,6 +630,15 @@ fn main() {
     std::fs::write(format!("{out_dir}/results.txt"), out).expect("cannot write results.txt");
 }
 
+/// A phrase filed under its trigger term, which is terms[at].
+struct Trig {
+    term: u32,
+    phrase: u32,
+    at: u32,
+    len: u32,
+    terms: [u32; 8],
+}
+
 /// One chunk's share of the index.
 struct Chunk {
     base: u32,             // first doc id of the chunk
@@ -712,3 +668,4 @@ fn line_start(docs: &[u8], p: usize) -> usize {
     }
     docs[p - 1..].iter().position(|&b| b == b'\n').map_or(docs.len(), |q| p + q)
 }
+
