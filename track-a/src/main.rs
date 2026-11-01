@@ -51,22 +51,24 @@ fn line_start(data: &[u8], mut p: usize) -> usize {
 }
 
 /// Calls `f(offset, line)` on every line (without its LF) in data[start..end]; both bounds are
-/// line starts. Newlines are found 32 bytes at a time with AVX2.
+/// line starts. Newlines are found 64 bytes at a time with AVX2.
 #[inline(always)]
 fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(usize, &'a [u8])) {
     let (mut line, mut pos) = (start, start);
-    while pos + 32 <= end {
-        let mut mask = unsafe {
-            let v = _mm256_loadu_si256(data.as_ptr().add(pos) as *const __m256i);
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))) as u32
+    while pos + 64 <= end {
+        // 64 bytes per step: two compares merged into one 64-bit mask halve the loop overhead.
+        let lf = |i: usize| unsafe {
+            let v = _mm256_loadu_si256(data.as_ptr().add(pos + i) as *const __m256i);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))) as u32 as u64
         };
+        let mut mask = lf(0) | lf(32) << 32;
         while mask != 0 {
             let lf = pos + mask.trailing_zeros() as usize;
             f(line, &data[line..lf]);
             line = lf + 1;
             mask &= mask - 1;
         }
-        pos += 32;
+        pos += 64;
     }
     for i in pos..end {
         if data[i] == b'\n' {
@@ -230,19 +232,18 @@ struct Bucket<T> {
     lat: Vec<u32>,
 }
 
+/// Appends `v` in decimal and then `end`. The digits go into a fixed 24-byte block that is
+/// appended whole and trimmed: a fixed-size copy is two vector moves, a variable one a call.
 fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
-    let mut tmp = [0u8; 21];
-    let mut i = 20;
-    tmp[20] = end;
-    loop {
-        i -= 1;
+    let n = v.checked_ilog10().map_or(1, |d| d as usize + 1);
+    let mut tmp = [end; 24];
+    for i in (0..n).rev() {
         tmp[i] = b'0' + (v % 10) as u8;
         v /= 10;
-        if v == 0 {
-            break;
-        }
     }
-    buf.extend_from_slice(&tmp[i..]);
+    let len = buf.len();
+    buf.extend_from_slice(&tmp);
+    buf.truncate(len + n + 1);
 }
 
 /// Formats hour `h` from its buckets (one per parse thread); `rank[t]` maps thread t's local
@@ -331,8 +332,13 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                     let mut table = Table::new();
                     let mut hours: Vec<Bucket<T>> = (0..HOURS).map(|_| Bucket::default()).collect();
                     let mut overflow = false;
+                    // Hour of the previous line: bytes 5..13 (`MM-DDTHH`) nearly always repeat.
+                    let (mut key, mut h) = (0u64, 0);
                     for_each_line(data, a, b, |_, l| {
-                        let (h, (ep, is_err, latency)) = (hour_of(l), parse_rest(l));
+                        if l[5..13] != key.to_le_bytes() {
+                            (key, h) = (u64::from_le_bytes(l[5..13].try_into().unwrap()), hour_of(l));
+                        }
+                        let (ep, is_err, latency) = parse_rest(l);
                         let Ok(id) = T::try_from(table.id(ep) << 1 | is_err as usize) else {
                             overflow = true;
                             return;
