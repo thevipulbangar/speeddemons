@@ -276,7 +276,7 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
             count[r as usize] += 1;
         }
     } // the records of this hour are freed here
-    let prefix = hour_label(h);
+    let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap(); // fixed size: no memcpy call
     let mut buf = Vec::with_capacity(total * 40);
     let mut a = 0;
     for r in 0..e {
@@ -286,7 +286,7 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
         }
         let v = &mut lat[a..b];
         let n = v.len();
-        buf.extend_from_slice(prefix.as_bytes());
+        buf.extend_from_slice(&prefix);
         buf.extend_from_slice(names[r]);
         buf.push(b' ');
         put_num(&mut buf, n as u64, b' ');
