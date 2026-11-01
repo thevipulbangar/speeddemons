@@ -13,9 +13,6 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
-static POOLMAX: AtomicUsize = AtomicUsize::new(0);
-static POOLSUM: AtomicUsize = AtomicUsize::new(0);
-static HEAPSUM: AtomicUsize = AtomicUsize::new(0);
 
 const THREADS: usize = 12; // the scoring box gives us exactly 12 hardware threads
 const INF: u64 = u64::MAX; // unreachable
@@ -52,6 +49,26 @@ fn num(d: &[u8], p: &mut usize) -> u64 {
         }
         x = x * 10 + (c - b'0') as u64;
     }
+}
+
+/// Reads a number of up to 7 digits at d[*p] with no branches (SWAR): digits have bit 0x10
+/// set and the separators (space, LF) do not, so the first separator is found with one mask
+/// and tzcnt; the digits are then combined pairwise with three multiplies. Needs 8 readable
+/// bytes at d[*p]; longer numbers (only the rare huge weights) take the byte loop.
+#[inline(always)]
+fn fast_num(d: &[u8], p: &mut usize) -> u64 {
+    let x = u64::from_le_bytes(unsafe { d.as_ptr().add(*p).cast::<[u8; 8]>().read_unaligned() });
+    let sep = !x & 0x1010_1010_1010_1010;
+    let len = sep.trailing_zeros() as usize / 8;
+    if len >= 8 {
+        return num(d, p);
+    }
+    *p += len + 1;
+    // Right-align the digits (len >= 1 always), so the empty bytes become leading zeros.
+    let mut y = (x & 0x0F0F_0F0F_0F0F_0F0F) << (64 - 8 * len);
+    y = (y * 10 + (y >> 8)) & 0x00FF_00FF_00FF_00FF;
+    y = (y * 100 + (y >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (y * 10000 + (y >> 32)) & 0xFFFF_FFFF
 }
 
 /// Runs f(k) for k in 0..12 on 12 threads and collects the results in order.
@@ -93,8 +110,17 @@ impl Edges {
     /// shorten a path.
     #[inline(always)]
     fn each(&self, k: usize, mut f: impl FnMut(usize, usize, u64)) {
-        let (d, mut p) = (self.d, self.cuts[k]);
-        while p < self.cuts[k + 1] {
+        let (d, mut p, end) = (self.d, self.cuts[k], self.cuts[k + 1]);
+        // A line is at most 3 * 11 bytes, so lines starting before `safe` have 8 bytes of
+        // slack after every number and can use fast_num.
+        let safe = end.min(d.len().saturating_sub(40));
+        while p < safe {
+            let (u, v, w) = (fast_num(d, &mut p), fast_num(d, &mut p), fast_num(d, &mut p));
+            if u != v {
+                f(u as usize, v as usize, w);
+            }
+        }
+        while p < end {
             let (u, v, w) = (num(d, &mut p), num(d, &mut p), num(d, &mut p));
             if u != v {
                 f(u as usize, v as usize, w);
@@ -185,7 +211,6 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
     cuts.push(d.len());
     let g = Edges { d, cuts };
     let nb = n.div_ceil(1 << LOW);
-    let t = std::time::Instant::now();
 
     // Pass 1: per-thread bucket counts and in-edge bitsets, all thread-local.
     let local = par(|k| {
@@ -215,7 +240,6 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
         }
     }
     drop(local);
-    eprintln!("pass1 {:?}", t.elapsed());
 
     // Pass 2: scatter (head << LOW | tail low bits) into the tail's bucket, then sort buckets.
     let mut heads: Vec<u32> = uninit(at as usize);
@@ -230,10 +254,8 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
         })
     });
     drop(cur);
-    eprintln!("pass2 {:?}", t.elapsed());
     let mut off1: Vec<u32> = uninit(n + 1);
     sort_buckets(&mut heads, &bstart, &mut off1, |r| r as usize & LOW_MASK, |r| r >> LOW);
-    eprintln!("sort2 {:?}", t.elapsed());
 
     // Region-growing BFS: each thread repeatedly takes the next unclaimed node of its slice of
     // ids as a root and runs BFS through unclaimed nodes. Nodes are claimed in an atomic bitset,
@@ -252,6 +274,10 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
             let mut i = q.len();
             q.push(root as u32);
             while i < q.len() {
+                // The queue says which rows come next: fetch them ahead of time.
+                if let Some(&a) = q.get(i + 8) {
+                    unsafe { prefetch(heads.as_ptr().add(off1[a as usize] as usize)) };
+                }
                 let u = q[i] as usize;
                 for &v in &heads[off1[u] as usize..off1[u + 1] as usize] {
                     if claim(v as usize) {
@@ -264,7 +290,6 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
         q
     });
     drop(heads);
-    eprintln!("bfs {:?}", t.elapsed());
 
     // perm: old -> new; new bucket sizes come from the old degrees.
     let mut perm: Vec<u32> = uninit(n);
@@ -285,7 +310,6 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
         bstart[b] = at;
         at += bsize.iter().map(|bs| bs[b]).sum::<u32>();
     }
-    eprintln!("perm {:?}", t.elapsed());
 
     // Pass 3: parse again, scatter each edge as (new head << LOW | new tail low bits, weight)
     // into the new tail's bucket through shared atomic cursors (a few thousand, so they stay
@@ -295,22 +319,35 @@ fn build(d: &'static [u8]) -> (Graph, Vec<u32>, Vec<u64>) {
     let out = Shared(edges.as_mut_ptr());
     let heavy = par(|k| {
         let mut heavy = Vec::new();
+        // Lines go through in batches: the perm lookups of a whole batch are prefetched before
+        // the first locked add, which would otherwise stall each lookup behind it.
+        let mut batch = Vec::with_capacity(32);
+        let mut flush = |batch: &mut Vec<(usize, usize, u64)>| {
+            for &(u, v, w) in batch.iter() {
+                let (u, v) = (perm[u] as usize, perm[v]);
+                let slot = bcur[u >> LOW].fetch_add(1, Relaxed) as usize;
+                out.put(slot, Edge { head: v << LOW | (u & LOW_MASK) as u32, w: w.min(ESCAPE) as u16 });
+                if w >= ESCAPE {
+                    heavy.push((u as u32, v, w));
+                }
+            }
+            batch.clear();
+        };
         g.each(k, |u, v, w| {
-            let (u, v) = (perm[u] as usize, perm[v]);
-            let slot = bcur[u >> LOW].fetch_add(1, Relaxed) as usize;
-            out.put(slot, Edge { head: v << LOW | (u & LOW_MASK) as u32, w: w.min(ESCAPE) as u16 });
-            if w >= ESCAPE {
-                heavy.push((u as u32, v, w));
+            unsafe { prefetch(perm.as_ptr().add(u)) };
+            unsafe { prefetch(perm.as_ptr().add(v)) };
+            batch.push((u, v, w));
+            if batch.len() == 32 {
+                flush(&mut batch);
             }
         });
+        flush(&mut batch);
         heavy
     });
-    eprintln!("pass3 {:?}", t.elapsed());
     let mut off: Vec<u32> = uninit(n + 1);
     sort_buckets(&mut edges, &bstart, &mut off, |e| e.head as usize & LOW_MASK, |e| Edge { head: e.head >> LOW, ..e });
     let mut heavy: Vec<_> = heavy.concat();
     heavy.sort_unstable();
-    eprintln!("sort3 {:?}", t.elapsed());
     (Graph { off, edges, heavy }, perm, has_in)
 }
 
@@ -319,129 +356,157 @@ unsafe fn prefetch<T>(p: *const T) {
     std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
 }
 
-/// Distances live in blocks of BLOCK consecutive node ids, allocated on first touch from a
-/// per-thread pool. With the BFS numbering a search touches few blocks, so the pool stays small.
-/// The pool's address space is reserved up front; only the pages a search reaches are ever
-/// backed by memory, and nothing is copied when it grows.
-const BLOCK: usize = 64;
-const NONE: u32 = u32::MAX;
-
-/// One thread's Dijkstra state, reused across queries.
+/// Radix heap for Dijkstra's monotone keys: an entry sits in bucket "highest bit where it
+/// differs from the last popped key". Pops are O(1) except when bucket 0 runs dry; then the
+/// lowest non-empty bucket is split around its minimum.
 ///
-/// The queue is a radix heap: a node waits in bucket "highest bit where its distance differs
-/// from the last settled distance". Distances only grow, so a pop is O(1) except when bucket 0
-/// runs dry; then the lowest non-empty bucket is split around its minimum. Buckets hold bare
-/// node ids (4 bytes) and read keys from the distance table, so a node whose distance dropped
-/// is simply re-filed under its new key; the `done` bits drop the duplicates.
-struct Search {
-    dir: Vec<u32>,    // block -> index in the pool, or NONE
-    dist: Vec<u64>,   // pool: BLOCK distances per allocated block
-    done: Vec<u64>,   // pool: one bit per node, set once the node is settled
-    blocks: Vec<u32>, // blocks allocated in this query, to reset dir
+/// An entry is 8 bytes: the low 32 bits of its key, then the node id. Every queued key is a
+/// settled distance plus one u32 weight, so it lies in [last, last + 2^32) and its low half
+/// is enough to rebuild it exactly.
+struct RadixHeap {
     last: u64,
-    buckets: [Vec<u32>; 65],
+    buckets: [Vec<u64>; 65],
 }
 
-impl Search {
-    fn new(n: usize) -> Self {
-        let nb = n.div_ceil(BLOCK);
-        Search {
-            dir: vec![NONE; nb],
-            dist: Vec::with_capacity(nb * BLOCK),
-            done: Vec::with_capacity(nb),
-            blocks: Vec::new(),
-            last: 0,
-            buckets: std::array::from_fn(|_| Vec::new()),
-        }
-    }
-
-    /// Pool index of v's distance, allocating v's block on first touch.
-    #[inline(always)]
-    fn slot(&mut self, v: usize) -> usize {
-        let b = v / BLOCK;
-        let mut i = self.dir[b];
-        if i == NONE {
-            i = self.done.len() as u32;
-            self.dist.extend_from_slice(&[INF; BLOCK]);
-            self.done.push(0);
-            self.dir[b] = i;
-            self.blocks.push(b as u32);
-        }
-        i as usize * BLOCK + v % BLOCK
-    }
-
-    /// Pool index of a node that is already in the pool.
-    #[inline(always)]
-    fn at(&self, v: u32) -> usize {
-        self.dir[v as usize / BLOCK] as usize * BLOCK + v as usize % BLOCK
+impl RadixHeap {
+    fn clear(&mut self) {
+        self.last = 0;
+        self.buckets.iter_mut().for_each(Vec::clear);
     }
 
     #[inline(always)]
-    fn settled(&self, v: u32) -> bool {
-        let i = self.at(v);
-        self.done[i / BLOCK] >> (i % BLOCK) & 1 != 0
+    fn key(&self, e: u64) -> u64 {
+        self.last + ((e >> 32) as u32).wrapping_sub(self.last as u32) as u64
     }
 
     #[inline(always)]
-    fn push(&mut self, v: u32, key: u64) {
-        self.buckets[(64 - (key ^ self.last).leading_zeros()) as usize].push(v);
+    fn file(&mut self, key: u64, e: u64) {
+        self.buckets[(64 - (key ^ self.last).leading_zeros()) as usize].push(e);
     }
 
-    /// Settles and returns the unsettled node with the smallest distance.
-    fn pop(&mut self) -> Option<u32> {
-        loop {
-            while let Some(v) = self.buckets[0].pop() {
-                if !self.settled(v) {
-                    let i = self.at(v);
-                    self.done[i / BLOCK] |= 1 << (i % BLOCK);
-                    return Some(v);
-                }
-            }
+    #[inline(always)]
+    fn push(&mut self, key: u64, v: u32) {
+        self.file(key, key << 32 | v as u64);
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        if self.buckets[0].is_empty() {
             let i = (1..65).find(|&i| !self.buckets[i].is_empty())?;
             let mut b = std::mem::take(&mut self.buckets[i]);
-            b.retain(|&v| !self.settled(v));
-            if let Some(min) = b.iter().map(|&v| self.dist[self.at(v)]).min() {
-                self.last = min;
-                for &v in &b {
-                    self.push(v, self.dist[self.at(v)]);
-                }
+            let old = self.last;
+            self.last = b.iter().map(|&e| self.key(e)).min().unwrap();
+            for &e in &b {
+                // Rebuild against the old `last`, then file against the new one.
+                let key = old + ((e >> 32) as u32).wrapping_sub(old as u32) as u64;
+                self.file(key, e);
             }
             b.clear();
             self.buckets[i] = b; // keep its capacity
         }
+        let e = self.buckets[0].pop()?;
+        Some((self.last, e as u32))
+    }
+}
+
+/// Distances live in blocks of BLOCK consecutive node ids, allocated on first touch from a
+/// per-thread pool. With the BFS numbering a search touches few blocks, so the pool stays small.
+const BLOCK: usize = 64;
+const NONE: u32 = u32::MAX;
+
+/// A distance slot: u32 for almost every search, u64 for the few that go past 2^32 - 2.
+trait Dist: Copy {
+    const INF: Self;
+    fn wide(self) -> u64;
+    fn narrow(x: u64) -> Self;
+}
+
+impl Dist for u32 {
+    const INF: u32 = u32::MAX;
+    fn wide(self) -> u64 {
+        self as u64
+    }
+    fn narrow(x: u64) -> u32 {
+        x as u32
+    }
+}
+
+impl Dist for u64 {
+    const INF: u64 = u64::MAX;
+    fn wide(self) -> u64 {
+        self
+    }
+    fn narrow(x: u64) -> u64 {
+        x
+    }
+}
+
+struct Search<D> {
+    dir: Vec<u32>,    // block -> index in pool, or NONE
+    pool: Vec<D>,     // BLOCK distances per allocated block
+    blocks: Vec<u32>, // blocks allocated in this query, to reset dir
+    heap: RadixHeap,
+}
+
+impl<D: Dist> Search<D> {
+    fn new(n: usize) -> Self {
+        Search {
+            dir: vec![NONE; n.div_ceil(BLOCK)],
+            pool: Vec::with_capacity(n.div_ceil(BLOCK) * BLOCK), // address space only
+            blocks: Vec::new(),
+            heap: RadixHeap { last: 0, buckets: std::array::from_fn(|_| Vec::new()) },
+        }
     }
 
-    fn run(&mut self, g: &Graph, s: usize, t: usize) -> u64 {
+    #[inline(always)]
+    fn dist(&mut self, v: usize) -> &mut D {
+        let b = v / BLOCK;
+        let mut i = self.dir[b];
+        if i == NONE {
+            i = (self.pool.len() / BLOCK) as u32;
+            self.pool.extend_from_slice(&[D::INF; BLOCK]);
+            self.dir[b] = i;
+            self.blocks.push(b as u32);
+        }
+        unsafe { self.pool.get_unchecked_mut(i as usize * BLOCK + v % BLOCK) }
+    }
+
+    /// Dijkstra from s, stopped when t is settled. Returns INF if t is unreachable, or None
+    /// if some tentative distance does not fit in D (the caller then retries with u64).
+    fn run(&mut self, g: &Graph, s: usize, t: usize) -> Option<u64> {
         for &b in &self.blocks {
             self.dir[b as usize] = NONE;
         }
         self.blocks.clear();
-        self.dist.clear();
-        self.done.clear();
-        self.buckets.iter_mut().for_each(Vec::clear);
-        self.last = 0;
-        let i = self.slot(s);
-        self.dist[i] = 0;
-        self.push(s as u32, 0);
-        while let Some(u) = self.pop() {
-            let du = self.last;
-            if u as usize == t {
-                return du;
+        self.pool.clear();
+        self.heap.clear();
+        *self.dist(s) = D::narrow(0);
+        self.heap.push(0, s as u32);
+        while let Some((du, u)) = self.heap.pop() {
+            let u = u as usize;
+            if du > self.dist(u).wide() {
+                continue; // stale entry
             }
-            for &e in &g.edges[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
+            if u == t {
+                return Some(du);
+            }
+            for &e in &g.edges[g.off[u] as usize..g.off[u + 1] as usize] {
                 let v = e.head;
-                let w = if e.w as u64 == ESCAPE { g.heavy(u, v) } else { e.w as u64 };
+                let w = if e.w as u64 == ESCAPE { g.heavy(u as u32, v) } else { e.w as u64 };
                 let nd = du + w;
-                let i = self.slot(v as usize);
-                if nd < self.dist[i] {
-                    self.dist[i] = nd;
-                    self.push(v, nd);
+                if nd >= D::INF.wide() {
+                    return None; // only heavy edges get here; rare
+                }
+                let dv = self.dist(v as usize);
+                if nd < dv.wide() {
+                    *dv = D::narrow(nd);
+                    self.heap.push(nd, v);
                     // v will be popped soon: start fetching its edge row now.
                     unsafe { prefetch(g.edges.as_ptr().add(*g.off.get_unchecked(v as usize) as usize)) };
                 }
             }
         }
-        INF
+        Some(INF)
     }
 }
 
@@ -450,9 +515,7 @@ fn main() {
     let data = args.get(1).map_or("/data", |s| s.as_str());
     let out = args.get(2).map_or("/out", |s| s.as_str());
 
-    let t0 = std::time::Instant::now();
     let (g, perm, has_in) = build(map_file(&format!("{data}/graph.txt")));
-    eprintln!("build {:?}", t0.elapsed());
     let n = g.off.len() - 1;
 
     // Queries in new ids. Trivial ones are answered here: s == t is 0; nothing reaches a node
@@ -476,21 +539,19 @@ fn main() {
 
     // Work-stealing over queries: each thread grabs the next index until none are left.
     let next = AtomicUsize::new(0);
-    let qt: usize = std::env::var("QT").map_or(THREADS, |v| v.parse().unwrap());
-    let tq = std::time::Instant::now();
-    par(|k| { if k >= qt { return; }
-        let mut s = Search::new(n);
+    par(|_| {
+        let mut small = Search::<u32>::new(n);
+        let mut wide: Option<Search<u64>> = None;
         while let Some((a, b, ans)) = queries.get(next.fetch_add(1, Relaxed)) {
             if ans.load(Relaxed) == TODO {
-                ans.store(s.run(&g, *a, *b), Relaxed);
-                POOLMAX.fetch_max(s.dist.len(), Relaxed);
+                let d = small.run(&g, *a, *b).unwrap_or_else(|| {
+                    let w = wide.get_or_insert_with(|| Search::new(n));
+                    w.run(&g, *a, *b).unwrap()
+                });
+                ans.store(d, Relaxed);
             }
         }
-        POOLSUM.fetch_add(s.dist.len()*8, Relaxed);
-        HEAPSUM.fetch_add(s.buckets.iter().map(|b| b.capacity()*4).sum::<usize>(), Relaxed);
     });
-    eprintln!("poolmax {} poolsum {}MB heapsum {}MB", POOLMAX.load(Relaxed), POOLSUM.load(Relaxed)>>20, HEAPSUM.load(Relaxed)>>20);
-    eprintln!("queries {:?} (phase {:?}) pool {}", t0.elapsed(), tq.elapsed(), 0);
 
     let mut text = String::with_capacity(queries.len() * 12);
     for (_, _, a) in &queries {
