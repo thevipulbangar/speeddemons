@@ -367,13 +367,15 @@ fn worker(c: &Ctx, k: usize, start: usize, end: usize, load_regions: bool) -> Pa
         let a = start & !4095;
         unsafe { madvise(d.as_ptr().add(a), end - a, 22) };
     }
+    // We own the name ids in [lo, ..): ids are split into equal ranges, owner = id * threads >> bits.
+    let lo = (k << c.names.bits).div_ceil(c.threads);
     let rows = (1usize << c.names.bits) / c.threads + 1;
     let mut bits = vec![[0u64; 4]; rows]; // (name id / threads, group) for the ids we own
     let take_mail = |bits: &mut Vec<[u64; 4]>| {
         c.waiting[k].store(false, Relaxed);
         for buf in std::mem::take(&mut *c.inbox[k].lock().unwrap()) {
             for v in buf {
-                bits[v as usize / 256 / c.threads][v as usize % 256 / 64] |= 1 << (v % 64);
+                bits[(v >> 8) as usize - lo][(v as usize & 255) / 64] |= 1 << (v % 64);
             }
         }
     };
@@ -411,7 +413,7 @@ fn worker(c: &Ctx, k: usize, start: usize, end: usize, load_regions: bool) -> Pa
                 ok = false;
                 break 'parse;
             };
-            let owner = id as usize % c.threads;
+            let owner = (id as usize * c.threads) >> c.names.bits;
             out[owner].push(id << 8 | g as u32);
             if out[owner].len() == MAIL {
                 c.inbox[owner].lock().unwrap().push(std::mem::replace(&mut out[owner], Vec::with_capacity(MAIL)));
