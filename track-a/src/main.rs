@@ -51,24 +51,22 @@ fn line_start(data: &[u8], mut p: usize) -> usize {
 }
 
 /// Calls `f(offset, line)` on every line (without its LF) in data[start..end]; both bounds are
-/// line starts. Newlines are found 64 bytes at a time with AVX2.
+/// line starts. Newlines are found 32 bytes at a time with AVX2.
 #[inline(always)]
 fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(usize, &'a [u8])) {
     let (mut line, mut pos) = (start, start);
-    while pos + 64 <= end {
-        // 64 bytes per step: two compares merged into one 64-bit mask halve the loop overhead.
-        let lf = |i: usize| unsafe {
-            let v = _mm256_loadu_si256(data.as_ptr().add(pos + i) as *const __m256i);
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))) as u32 as u64
+    while pos + 32 <= end {
+        let mut mask = unsafe {
+            let v = _mm256_loadu_si256(data.as_ptr().add(pos) as *const __m256i);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))) as u32
         };
-        let mut mask = lf(0) | lf(32) << 32;
         while mask != 0 {
             let lf = pos + mask.trailing_zeros() as usize;
             f(line, &data[line..lf]);
             line = lf + 1;
             mask &= mask - 1;
         }
-        pos += 64;
+        pos += 32;
     }
     for i in pos..end {
         if data[i] == b'\n' {
@@ -225,18 +223,19 @@ impl Table {
     }
 }
 
-/// Appends `v` in decimal and then `end`. The digits go into a fixed 24-byte block that is
-/// appended whole and trimmed: a fixed-size copy is two vector moves, a variable one a call.
 fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
-    let n = v.checked_ilog10().map_or(1, |d| d as usize + 1);
-    let mut tmp = [end; 24];
-    for i in (0..n).rev() {
+    let mut tmp = [0u8; 21];
+    let mut i = 20;
+    tmp[20] = end;
+    loop {
+        i -= 1;
         tmp[i] = b'0' + (v % 10) as u8;
         v /= 10;
+        if v == 0 {
+            break;
+        }
     }
-    let len = buf.len();
-    buf.extend_from_slice(&tmp);
-    buf.truncate(len + n + 1);
+    buf.extend_from_slice(&tmp[i..]);
 }
 
 /// Per-thread state for pass 2, reused from one hour to the next.
@@ -298,7 +297,7 @@ impl HourWork {
             self.lat[*c as usize] = v;
             *c += 1;
         }
-        let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap();
+        let prefix = hour_label(h);
         let mut a = 0;
         for &i in &self.order {
             let b = self.counts[i] as usize; // after the scatter this is the range's end
@@ -307,7 +306,7 @@ impl HourWork {
             }
             let v = &mut self.lat[a..b];
             let cnt = v.len();
-            buf.extend_from_slice(&prefix);
+            buf.extend_from_slice(prefix.as_bytes());
             buf.extend_from_slice(table.key(i));
             buf.push(b' ');
             put_num(buf, cnt as u64, b' ');
