@@ -1,7 +1,7 @@
 //! Track A (Ingest): per (hour, endpoint) request count, p50/p95/p99 latency and 5xx rate.
 //!
 //! The log is mmapped and read once:
-//!   parse   one chunk per thread; every line becomes a 6-byte record (endpoint id with the
+//!   parse   one chunk per thread; every line becomes a 4-byte record (endpoint id with the
 //!           5xx flag, latency) in that thread's bucket for the line's hour, inside one
 //!           reservation sized for the chunk;
 //!   names   all threads' endpoints are deduplicated and sorted once, which maps every local
@@ -243,44 +243,55 @@ impl Table {
     }
 }
 
-/// An endpoint id with the 5xx flag in bit 0: u16 (6-byte records) normally, u32 when an
-/// input has more than 32,767 distinct endpoints (the spec's catalogue has 1,842).
-trait Id: Copy + Default + Send + 'static + TryFrom<usize> + Into<u32> {}
-impl Id for u16 {}
-impl Id for u32 {}
-
-/// One thread's lines of one hour: `ids[i]` is endpoint id << 1 | is_5xx, `lat[i]` the latency.
-/// Both arrays live in one block reserved up front (MAP_NORESERVE: only pages written count),
+/// One thread's lines of one hour. A record packs latency << 12 | key, where the key is
+/// endpoint id << 1 | is_5xx: 4 bytes for ids below 2,048 (the spec's catalogue has 1,842) and
+/// latencies below 2^20 us. A line that does not pack goes to `side` as (key, latency).
+/// The records live in one block reserved up front (MAP_NORESERVE: only pages written count)
 /// with room for every line of the thread's chunk, so a record is stored without a capacity
 /// check, and nothing is ever reallocated (realloc remaps under the process-wide mmap lock).
-struct Bucket<T: 'static> {
-    ids: &'static mut [T],
-    lat: &'static mut [u32],
+struct Bucket {
+    rec: &'static mut [u32],
     n: usize,
+    side: Vec<[u32; 2]>,
 }
 
-impl<T: 'static> Bucket<T> {
+impl Bucket {
     /// `HOURS` buckets with room for `lines` records each.
     fn reserve(lines: usize) -> Vec<Self> {
-        let cap = (lines + 2048) & !2047; // keeps both arrays on whole pages
-        let block = cap * (size_of::<T>() + 4);
-        let p = anon(HOURS * block);
-        // SAFETY: each bucket's two arrays are its own disjoint part of the reservation.
-        let bucket = |h: usize| unsafe {
-            let q = p.add(h * block);
-            let ids = std::slice::from_raw_parts_mut(q as *mut T, cap);
-            let lat = std::slice::from_raw_parts_mut(q.add(cap * size_of::<T>()) as *mut u32, cap);
-            Bucket { ids, lat, n: 0 }
-        };
-        (0..HOURS).map(bucket).collect()
+        let cap = (lines + 1024) & !1023; // keeps every bucket on whole pages
+        let p = anon(HOURS * cap * 4) as *mut u32;
+        // SAFETY: each bucket is its own disjoint part of the reservation.
+        let rec = |h: usize| unsafe { std::slice::from_raw_parts_mut(p.add(h * cap), cap) };
+        (0..HOURS).map(|h| Bucket { rec: rec(h), n: 0, side: Vec::new() }).collect()
+    }
+
+    /// Files one line. SAFETY: the bucket has room for it.
+    #[inline(always)]
+    unsafe fn push(&mut self, key: usize, lat: u32) {
+        if key < 1 << 12 && lat < 1 << 20 {
+            *self.rec.get_unchecked_mut(self.n) = lat << 12 | key as u32;
+            self.n += 1;
+        } else {
+            self.escape(key, lat);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn escape(&mut self, key: usize, lat: u32) {
+        self.side.push([key as u32, lat]);
+    }
+
+    /// Every line as (key, latency); used with `for_each`, which runs the two parts as two loops.
+    fn lines(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        let packed = self.rec[..self.n].iter().map(|&x| ((x & 0xFFF) as usize, x >> 12));
+        packed.chain(self.side.iter().map(|s| (s[0] as usize, s[1])))
     }
 
     /// Hands the written pages back (MADV_DONTNEED).
     fn free(self) {
-        let page = |n: usize| (n + 4095) & !4095;
-        let n = self.n;
-        unsafe { madvise(self.ids.as_mut_ptr().cast(), page(n * size_of::<T>()), 4) };
-        unsafe { madvise(self.lat.as_mut_ptr().cast(), page(n * 4), 4) };
+        let bytes = (self.n * 4 + 4095) & !4095;
+        unsafe { madvise(self.rec.as_mut_ptr().cast(), bytes, 4) };
     }
 }
 
@@ -308,23 +319,18 @@ type Rows = (Vec<Row>, usize);
 
 /// The rows of one hour `hr` from its buckets (one per parse thread), and their size as text;
 /// `rank` maps endpoint ids to positions in `names`. `lat` is scratch space reused per hour.
-fn tally<T: Id>(mut hr: Vec<Bucket<T>>, rank: &[u32], names: &[&[u8]], lat: &mut Vec<u32>) -> Rows {
+fn tally(hr: Vec<Bucket>, rank: &[u32], names: &[&[u8]], lat: &mut Vec<u32>) -> Rows {
     let e = names.len();
     let mut count = vec![0u32; 2 * e]; // [lines per rank | errors per rank]
     let mut total = 0;
-    for b in &mut hr {
-        for x in &mut b.ids[..b.n] {
-            let v: u32 = (*x).into();
-            // SAFETY: every id came from the table, which `rank` covers, and every rank is below
-            // the number of ids, which all fit in `T` (else `run` would have stopped).
-            unsafe {
-                let r = *rank.get_unchecked(v as usize >> 1) as usize;
-                *count.get_unchecked_mut(r) += 1;
-                *count.get_unchecked_mut(e + r) += v & 1;
-                *x = T::try_from(r).unwrap_unchecked(); // remap to the rank once, for the scatter
-            }
-        }
-        total += b.n;
+    for b in &hr {
+        // SAFETY: every id came from the table, which `rank` covers, and every rank is below e.
+        b.lines().for_each(|(k, _)| unsafe {
+            let r = *rank.get_unchecked(k >> 1) as usize;
+            *count.get_unchecked_mut(r) += 1;
+            *count.get_unchecked_mut(e + r) += (k & 1) as u32;
+        });
+        total += b.n + b.side.len();
     }
     // Counting sort: each endpoint gets a contiguous range of `lat`, ranges in name order.
     let mut pos = 0;
@@ -333,12 +339,12 @@ fn tally<T: Id>(mut hr: Vec<Bucket<T>>, rank: &[u32], names: &[&[u8]], lat: &mut
     }
     lat.resize(total, 0);
     for b in hr {
-        for (&r, &v) in b.ids[..b.n].iter().zip(&b.lat[..b.n]) {
-            let c = &mut count[Into::<u32>::into(r) as usize];
-            // SAFETY: the cursors of rank r run over r's own range, which lies inside `total`.
-            unsafe { *lat.get_unchecked_mut(*c as usize) = v };
+        // SAFETY: as above, and the cursors of rank r run over r's own range inside `total`.
+        b.lines().for_each(|(k, v)| unsafe {
+            let c = count.get_unchecked_mut(*rank.get_unchecked(k >> 1) as usize);
+            *lat.get_unchecked_mut(*c as usize) = v;
             *c += 1;
-        }
+        });
         b.free();
     }
     let (mut rows, mut size) = (Vec::new(), 0);
@@ -403,19 +409,20 @@ fn main() {
     options.read(true).write(true).create(true); // read too: the output is mapped
     let file = options.open(format!("{out_dir}/summary.txt")).expect("cannot create summary.txt");
     // Compact ids first; only an input with too many endpoints for them pays for a second run.
-    let _ = run::<u16>(data, &file) || run::<u32>(data, &file);
+    let _ = run(data, &file, false) || run(data, &file, true);
 }
 
 /// The whole job with ids of type `T`. Returns false, having written nothing, if some id
 /// does not fit in `T`.
-fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
+fn run(data: &'static [u8], file: &File, big: bool) -> bool {
     let len = data.len();
 
     // Parse: one shared endpoint table, and per thread one bucket per hour.
-    let keys = (len / 40 + 1).min(1 << (8 * size_of::<T>() - 1)); // lines, and what ids can number
+    // The first run's table holds the ids that pack; the second (`big`) one any line's key.
+    let keys = (len / 40 + 1).min(if big { usize::MAX } else { 1 << 11 });
     let table = &Table::new(keys, (len + len / 8 + 4).min(keys * 130)); // every key with its id
     // Each thread files its buckets under their hours when its chunk is done.
-    let by_hour: Vec<Mutex<Vec<Bucket<T>>>> = (0..HOURS).map(|_| Mutex::default()).collect();
+    let by_hour: Vec<Mutex<Vec<Bucket>>> = (0..HOURS).map(|_| Mutex::default()).collect();
     thread::scope(|s| {
         for t in 0..THREADS {
             let by_hour = &by_hour;
@@ -423,7 +430,7 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                 let a = line_start(data, t * len / THREADS);
                 let b = line_start(data, (t + 1) * len / THREADS);
                 // A line is at least 40 bytes with its LF, so no hour gets more than this.
-                let mut hours = Bucket::<T>::reserve((b - a) / 40 + 1);
+                let mut hours = Bucket::reserve((b - a) / 40 + 1);
                 // Hour of the previous line: bytes 5..13 (`MM-DDTHH`) nearly always repeat.
                 let (mut key, mut h) = (0u64, 0);
                 for_each_line(data, a, b, |_, l| {
@@ -431,16 +438,11 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                         (key, h) = (u64::from_le_bytes(l[5..13].try_into().unwrap()), hour_of(l));
                     }
                     let (ep, is_err, latency) = parse_rest(l);
-                    // Fits in T unless the table filled up, and then the run is discarded.
-                    let id = T::try_from(table.id(ep) << 1 | is_err as usize).unwrap_or_default();
+                    // A full table (the first run only) gives a key that is never used.
+                    let key = table.id(ep) << 1 | is_err as usize;
                     // SAFETY: the spec puts every timestamp inside the 72 hours, so h < HOURS,
                     // and a bucket has room for every line of the chunk.
-                    unsafe {
-                        let b = hours.get_unchecked_mut(h);
-                        *b.ids.get_unchecked_mut(b.n) = id;
-                        *b.lat.get_unchecked_mut(b.n) = latency;
-                        b.n += 1;
-                    }
+                    unsafe { hours.get_unchecked_mut(h).push(key, latency) };
                 });
                 for (h, b) in hours.into_iter().enumerate() {
                     by_hour[h].lock().unwrap().push(b);
