@@ -2,16 +2,17 @@
 //!
 //! The log is mmapped and read once:
 //!   parse   one chunk per thread; every line becomes a 6-byte record (endpoint id with the
-//!           5xx flag, latency) in that thread's bucket for the line's hour;
+//!           5xx flag, latency) in that thread's bucket for the line's hour, inside one
+//!           reservation sized for the chunk;
 //!   names   all threads' endpoints are deduplicated and sorted once, which maps every local
 //!           id to its rank, the output order inside an hour;
 //!   finish  hours are handed out in order; a worker counting-sorts the hour's records from
-//!           all threads by rank, frees them, picks the percentiles and writes the hour at
-//!           its file offset once every earlier hour has claimed its place.
+//!           all threads by rank, frees them, picks the percentiles and the hour's exact text
+//!           size; then the output file is mapped at its final size and every hour is
+//!           formatted straight into its place.
 //! Disorder in the log never matters: a line simply goes to its hour's bucket.
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -22,6 +23,7 @@ const THREADS: usize = 12; // the scoring box gives us exactly 12 hardware threa
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 fn map_file(path: &str) -> &'static [u8] {
@@ -225,40 +227,75 @@ impl Table {
 }
 /// An endpoint id with the 5xx flag in bit 0: u16 (6-byte records) normally, u32 when an
 /// input has more than 32,767 distinct endpoints (the spec's catalogue has 1,842).
-trait Id: Copy + Default + Send + TryFrom<usize> + Into<u32> {}
+trait Id: Copy + Default + Send + 'static + TryFrom<usize> + Into<u32> {}
 impl Id for u16 {}
 impl Id for u32 {}
 
 /// One thread's lines of one hour: `ids[i]` is endpoint id << 1 | is_5xx, `lat[i]` the latency.
-#[derive(Default)]
-struct Bucket<T> {
-    ids: Vec<T>,
-    lat: Vec<u32>,
+/// Both arrays live in one block reserved up front (MAP_NORESERVE: only pages written count),
+/// with room for every line of the thread's chunk, so a record is stored without a capacity
+/// check, and nothing is ever reallocated (realloc remaps under the process-wide mmap lock).
+struct Bucket<T: 'static> {
+    ids: &'static mut [T],
+    lat: &'static mut [u32],
+    n: usize,
 }
 
-/// Appends `v` in decimal and then `end`. The digits go into a fixed 24-byte block that is
-/// appended whole and trimmed: a fixed-size copy is two vector moves, a variable one a call.
-fn put_num(buf: &mut Vec<u8>, mut v: u64, end: u8) {
-    let n = v.checked_ilog10().map_or(1, |d| d as usize + 1);
-    let mut tmp = [end; 24];
+impl<T: 'static> Bucket<T> {
+    /// `HOURS` buckets with room for `lines` records each.
+    fn reserve(lines: usize) -> Vec<Self> {
+        let cap = (lines + 2048) & !2047; // keeps both arrays on whole pages
+        let block = cap * (size_of::<T>() + 4);
+        let p = unsafe { mmap(std::ptr::null_mut(), HOURS * block, 3, 0x4022, -1, 0) };
+        assert!(p as isize != -1, "cannot reserve records");
+        // No transparent huge pages (MADV_NOHUGEPAGE): where THP is "always", every touched
+        // 2 MB extent of this sparse reservation would be backed and charged whole (~240 MB).
+        unsafe { madvise(p, HOURS * block, 15) };
+        let at = |h: usize, off: usize| unsafe { p.add(h * block + off) };
+        // SAFETY: each bucket's two arrays are its own disjoint part of the reservation.
+        (0..HOURS).map(|h| unsafe { Bucket { ids: std::slice::from_raw_parts_mut(at(h, 0) as *mut T, cap), lat: std::slice::from_raw_parts_mut(at(h, cap * size_of::<T>()) as *mut u32, cap), n: 0 } }).collect()
+    }
+
+    /// Hands the written pages back (MADV_DONTNEED).
+    fn free(self) {
+        let page = |n: usize| (n + 4095) & !4095;
+        unsafe {
+            madvise(self.ids.as_mut_ptr() as *mut u8, page(self.n * size_of::<T>()), 4);
+            madvise(self.lat.as_mut_ptr() as *mut u8, page(self.n * 4), 4);
+        }
+    }
+}
+
+/// Decimal digits of `v`.
+fn digits(v: u32) -> usize {
+    v.checked_ilog10().map_or(1, |d| d as usize + 1)
+}
+
+/// Writes `v` in decimal and then `end` at `*o`, exactly `digits(v) + 1` bytes, and advances `*o`.
+/// SAFETY: the caller sized the destination for it.
+unsafe fn put_num(o: &mut *mut u8, mut v: u32, end: u8) {
+    let n = digits(v);
     for i in (0..n).rev() {
-        tmp[i] = b'0' + (v % 10) as u8;
+        *o.add(i) = b'0' + (v % 10) as u8;
         v /= 10;
     }
-    let len = buf.len();
-    buf.extend_from_slice(&tmp);
-    buf.truncate(len + n + 1);
+    *o.add(n) = end;
+    *o = o.add(n + 1);
 }
 
-/// Formats hour `h` from its buckets (one per parse thread); `rank[t]` maps thread t's local
-/// endpoint ids to positions in `names`. `count` and `lat` are scratch space reused per hour.
-fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], names: &[&[u8]], count: &mut Vec<u32>, lat: &mut Vec<u32>) -> Vec<u8> {
+/// One output line before formatting: rank, count, p50, p95, p99, errors.
+type Row = [u32; 6];
+
+/// The rows of one hour from its buckets (one per parse thread), and their size as text;
+/// `rank[t]` maps thread t's local endpoint ids to positions in `names`. `count` and `lat` are
+/// scratch space reused per hour.
+fn hour_rows<T: Id>(mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], names: &[&[u8]], count: &mut Vec<u32>, lat: &mut Vec<u32>) -> (Vec<Row>, usize) {
     let e = names.len();
     count.clear();
     count.resize(2 * e, 0); // [lines per rank | errors per rank]
     let mut total = 0;
     for (b, rank) in buckets.iter_mut().zip(rank) {
-        for x in b.ids.iter_mut() {
+        for x in &mut b.ids[..b.n] {
             let v: u32 = (*x).into();
             // SAFETY: every id came from this thread's table, which `rank` covers, and every rank
             // is below `e`, which `run` checked fits in `T`.
@@ -269,7 +306,7 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
                 *x = T::try_from(r).unwrap_unchecked(); // remap to the rank once, for the scatter
             }
         }
-        total += b.ids.len();
+        total += b.n;
     }
     // Counting sort: each endpoint gets a contiguous range of `lat`, ranges in name order.
     let mut pos = 0;
@@ -278,15 +315,15 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
     }
     lat.resize(total, 0);
     for b in buckets {
-        for (&r, &v) in b.ids.iter().zip(&b.lat) {
+        for (&r, &v) in b.ids[..b.n].iter().zip(&b.lat[..b.n]) {
             let c = &mut count[Into::<u32>::into(r) as usize];
             // SAFETY: the cursors of rank r run over r's own range, which lies inside `total`.
             unsafe { *lat.get_unchecked_mut(*c as usize) = v };
             *c += 1;
         }
-    } // the records of this hour are freed here
-    let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap(); // fixed size: no memcpy call
-    let mut buf = Vec::with_capacity(total * 40);
+        b.free();
+    }
+    let (mut rows, mut size) = (Vec::new(), 0);
     let mut a = 0;
     for r in 0..e {
         let b = count[r] as usize; // after the scatter this is the end of rank r's range
@@ -295,29 +332,45 @@ fn format_hour<T: Id>(h: usize, mut buckets: Vec<Bucket<T>>, rank: &[Vec<u32>], 
         }
         let v = &mut lat[a..b];
         let n = v.len();
-        buf.extend_from_slice(&prefix);
-        buf.extend_from_slice(names[r]);
-        buf.push(b' ');
-        put_num(&mut buf, n as u64, b' ');
         // Nearest rank: 0-based index ceil(p*n/100) - 1. Each select leaves everything from
         // that index on in v[lo..], so the next search is smaller.
         // Small groups (most of them, in the Zipf tail): one insertion sort beats three selects.
         if n <= 32 {
             v.sort_unstable();
         }
+        let mut row = [r as u32, n as u32, 0, 0, 0, count[e + r]];
         let mut lo = 0;
-        for p in [50, 95, 99] {
+        for (i, p) in [50, 95, 99].into_iter().enumerate() {
             let k = (p * n + 99) / 100 - 1;
-            let x = if n <= 32 { v[k] } else { *v[lo..].select_nth_unstable(k - lo).1 };
-            put_num(&mut buf, x as u64, b' ');
+            row[2 + i] = if n <= 32 { v[k] } else { *v[lo..].select_nth_unstable(k - lo).1 };
             lo = k;
         }
-        let errs = count[e + r] as u64;
-        put_num(&mut buf, errs, b' ');
-        put_num(&mut buf, errs * 1_000_000 / n as u64, b'\n');
+        // The line: label (21), name, a space, then six numbers each followed by one byte.
+        size += 28 + names[r].len() + row[1..].iter().map(|&x| digits(x)).sum::<usize>() + digits(ppm(&row));
+        rows.push(row);
         a = b;
     }
-    buf
+    (rows, size)
+}
+
+fn ppm(row: &Row) -> u32 {
+    (row[5] as u64 * 1_000_000 / row[1] as u64) as u32
+}
+
+/// Formats hour `h`'s rows into `o`, which has exactly their size.
+unsafe fn write_hour(h: usize, rows: &[Row], names: &[&[u8]], mut o: *mut u8) {
+    let prefix: [u8; 21] = hour_label(h).as_bytes().try_into().unwrap(); // fixed size: no memcpy call
+    for row in rows {
+        let name = names[row[0] as usize];
+        (o as *mut [u8; 21]).write_unaligned(prefix);
+        std::ptr::copy_nonoverlapping(name.as_ptr(), o.add(21), name.len());
+        *o.add(21 + name.len()) = b' ';
+        o = o.add(22 + name.len());
+        for &x in &row[1..] {
+            put_num(&mut o, x, b' ');
+        }
+        put_num(&mut o, ppm(row), b'\n');
+    }
 }
 
 fn main() {
@@ -325,7 +378,7 @@ fn main() {
     let data_dir = args.get(1).map_or("/data", String::as_str);
     let out_dir = args.get(2).map_or("/out", String::as_str);
     let data = map_file(&format!("{data_dir}/requests.log"));
-    let file = File::create(format!("{out_dir}/summary.txt")).expect("cannot create summary.txt");
+    let file = File::options().read(true).write(true).create(true).open(format!("{out_dir}/summary.txt")).expect("cannot create summary.txt");
     // Compact ids first; only an input with too many endpoints for them pays for a second run.
     let _ = run::<u16>(data, &file) || run::<u32>(data, &file);
 }
@@ -343,7 +396,8 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                     let a = line_start(data, t * len / THREADS);
                     let b = line_start(data, (t + 1) * len / THREADS);
                     let mut table = Table::new();
-                    let mut hours: Vec<Bucket<T>> = (0..HOURS).map(|_| Bucket::default()).collect();
+                    // A line is at least 40 bytes with its LF, so no hour gets more than this.
+                    let mut hours = Bucket::<T>::reserve((b - a) / 40 + 1);
                     let mut overflow = false;
                     // Hour of the previous line: bytes 5..13 (`MM-DDTHH`) nearly always repeat.
                     let (mut key, mut h) = (0u64, 0);
@@ -356,10 +410,14 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                             overflow = true;
                             return;
                         };
-                        // SAFETY: the spec puts every timestamp inside the 72 hours, so h < HOURS.
-                        let bucket = unsafe { hours.get_unchecked_mut(h) };
-                        bucket.ids.push(id);
-                        bucket.lat.push(latency);
+                        // SAFETY: the spec puts every timestamp inside the 72 hours, so h < HOURS,
+                        // and a bucket has room for every line of the chunk.
+                        unsafe {
+                            let b = hours.get_unchecked_mut(h);
+                            *b.ids.get_unchecked_mut(b.n) = id;
+                            *b.lat.get_unchecked_mut(b.n) = latency;
+                            b.n += 1;
+                        }
                     });
                     (table, hours, overflow)
                 })
@@ -370,16 +428,10 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
 
     // Names: dedupe all threads' endpoints through one table, sort the distinct ones, and map
     // every thread's local ids to the sorted position.
-    if parsed.iter().any(|p| p.2) {
-        return false;
-    }
     let mut all = Table::new();
-    for (table, _, _) in &parsed {
-        for k in (0..table.spans.len()).map(|i| table.key(i)) {
-            all.id(k);
-        }
-    }
-    if T::try_from(all.spans.len() << 1).is_err() {
+    let global: Vec<Vec<usize>> = parsed.iter().map(|(t, _, _)| (0..t.spans.len()).map(|i| all.id(t.key(i))).collect()).collect();
+    if parsed.iter().any(|p| p.2) || T::try_from(all.spans.len() << 1).is_err() {
+        parsed.into_iter().flat_map(|p| p.1).for_each(Bucket::free);
         return false;
     }
     let mut order: Vec<usize> = (0..all.spans.len()).collect();
@@ -390,20 +442,22 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
     }
     let mut rank = Vec::new();
     let mut by_hour: Vec<Mutex<Vec<Bucket<T>>>> = (0..HOURS).map(|_| Mutex::default()).collect();
-    for (table, hours, _) in parsed {
-        let local = (0..table.spans.len()).map(|i| global_rank[all.id(table.key(i))]);
-        rank.push(local.collect::<Vec<u32>>());
+    for ((_, hours, _), g) in parsed.into_iter().zip(global) {
+        rank.push(g.into_iter().map(|i| global_rank[i]).collect::<Vec<u32>>());
         for (h, b) in hours.into_iter().enumerate() {
             by_hour[h].get_mut().unwrap().push(b);
         }
     }
     let names: Vec<&[u8]> = order.iter().map(|&i| all.key(i)).collect();
 
-    // Finish: hours handed out in increasing order, so the writer rarely has to wait.
-    let next_hour = AtomicUsize::new(0);
-    // Hours finish out of order. Each finished hour waits in `pending` until every earlier hour
-    // has claimed its place, so file offsets go out in output order: (next hour, its offset).
-    let out = Mutex::new((0, 0, vec![None; HOURS]));
+    // Finish: hours handed out in increasing order. Each hour's rows and text size come first;
+    // then the file gets its final size and is mapped, and every hour is formatted straight into
+    // its place. No write() calls: concurrent writes to one file serialize on its inode lock,
+    // page faults on a shared mapping do not.
+    let (next_hour, next_text) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let rows: Vec<Mutex<(Vec<Row>, usize)>> = (0..HOURS).map(|_| Mutex::default()).collect();
+    let at = std::sync::OnceLock::new(); // (mapping address, offset of every hour and the end)
+    let barrier = std::sync::Barrier::new(THREADS);
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
@@ -414,21 +468,31 @@ fn run<T: Id>(data: &'static [u8], file: &File) -> bool {
                         break;
                     }
                     let buckets = std::mem::take(&mut *by_hour[h].lock().unwrap());
-                    let buf = format_hour(h, buckets, &rank, &names, &mut count, &mut lat);
-                    // Under the lock only claim file offsets; the writes themselves run unlocked.
-                    let mut ready = Vec::new();
-                    {
-                        let (next, offset, pending) = &mut *out.lock().unwrap();
-                        pending[h] = Some(buf);
-                        while let Some(done) = pending.get_mut(*next).and_then(Option::take) {
-                            *offset += done.len() as u64;
-                            ready.push((*offset - done.len() as u64, done));
-                            *next += 1;
-                        }
+                    *rows[h].lock().unwrap() = hour_rows(buckets, &rank, &names, &mut count, &mut lat);
+                }
+                drop((count, lat));
+                if barrier.wait().is_leader() {
+                    let mut off = vec![0];
+                    for r in &rows {
+                        off.push(off[off.len() - 1] + r.lock().unwrap().1);
                     }
-                    for (off, done) in ready {
-                        file.write_all_at(&done, off).unwrap();
+                    let total = off[HOURS];
+                    file.set_len(total as u64).expect("cannot size summary.txt");
+                    // (an empty output still gets a mapping, which is never touched)
+                    let p = unsafe { mmap(std::ptr::null_mut(), total.max(1), 3, 1, file.as_raw_fd(), 0) } as usize;
+                    assert!(p as isize != -1, "mmap failed");
+                    at.set((p, off)).unwrap();
+                }
+                barrier.wait();
+                let (p, off) = at.get().unwrap();
+                loop {
+                    let h = next_text.fetch_add(1, Relaxed);
+                    if h >= HOURS {
+                        break;
                     }
+                    let (r, _) = std::mem::take(&mut *rows[h].lock().unwrap());
+                    // SAFETY: hour h owns bytes off[h]..off[h + 1] of the mapping, its exact size.
+                    unsafe { write_hour(h, &r, &names, (*p as *mut u8).add(off[h])) };
                 }
             });
         }
